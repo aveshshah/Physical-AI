@@ -41,6 +41,16 @@ class LocalEnvironment:
     yaw_deg: float = 0.0  # rotate the scene about the origin
     collider_prims: list[str] = field(default_factory=list)  # meshes under these get static colliders
     add_sky: bool = False  # the file has no sun / sky light of its own
+    # Collide with one seamless surface resampled from the collider meshes (grid spacing, m) instead
+    # of the meshes themselves. Render meshes are split into pieces whose open boundary edges act as
+    # small ledges for a rolling wheel (PhysX cannot tell two flush meshes form one surface), which
+    # kicks vehicles up at every seam. None = collide with the render meshes directly.
+    drive_surface_grid: float | None = None
+    drive_surface_margin: float = 3.0  # m kept around drivable (non-terrain) meshes
+    # Gaussian smoothing of the surface heights (m). The render meshes meet with cm-scale offsets
+    # that a real tyre and suspension absorb; a rigid robot on sphere wheels would feel every one.
+    drive_surface_smoothing: float = 0.45
+    terrain_prims: tuple[str, ...] = ()  # collider meshes that are terrain (height only, not drivable area)
 
 
 # Mcity Test Facility (University of Michigan) digital twin, Omniverse version, MIT licence:
@@ -66,8 +76,126 @@ LOCAL_ENVIRONMENTS = {
             "Terrain/StaticTerrainMeshes/SM_McityRoundabout_Concrete",
         ],
         add_sky=True,
+        drive_surface_grid=0.3,
+        terrain_prims=("Terrain/StaticTerrainMeshes/SM_Ground",),
     ),
 }
+
+
+def _surface_heights(stage, env: LocalEnvironment, prim_path: str):
+    """Height of the collider meshes at every node of a regular grid (scene frame), and a mask of the
+    nodes within ``drive_surface_margin`` of a drivable (non-terrain) mesh. Where a drivable mesh
+    exists it defines the height (the highest drivable one, so curbs stay curbs); terrain only fills
+    the rest, because the terrain mesh pokes a few cm through the asphalt in places."""
+    from pxr import Usd, UsdGeom
+
+    g = float(env.drive_surface_grid)
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    tris = []  # (n, 3, 3) per prim, and whether drivable
+    for rel in env.collider_prims:
+        root = stage.GetPrimAtPath(f"{prim_path}/{rel}")
+        if not root.IsValid():
+            continue
+        for p in Usd.PrimRange(root):
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            m = UsdGeom.Mesh(p)
+            P = np.asarray(m.GetPointsAttr().Get(), dtype=float)
+            M = np.asarray(cache.GetLocalToWorldTransform(p), dtype=float)
+            W = np.c_[P, np.ones(len(P))] @ M
+            cnt = np.asarray(m.GetFaceVertexCountsAttr().Get())
+            idx = np.asarray(m.GetFaceVertexIndicesAttr().Get())
+            starts = np.r_[0, np.cumsum(cnt)[:-1]]
+            T = [(idx[s0], idx[s0 + k], idx[s0 + k + 1]) for s0, c in zip(starts, cnt) for k in range(1, c - 1)]
+            tris.append((W[:, :3][np.asarray(T)], rel not in env.terrain_prims))
+    allp = np.concatenate([t.reshape(-1, 3) for t, d in tris if d])
+    lo, hi = allp[:, :2].min(axis=0) - env.drive_surface_margin, allp[:, :2].max(axis=0) + env.drive_surface_margin
+    nx, ny = (np.ceil((hi - lo) / g).astype(int) + 1)
+    Zd = np.full((nx, ny), -np.inf)  # drivable meshes
+    Zt = np.full((nx, ny), -np.inf)  # terrain
+    drivable = np.zeros((nx, ny), dtype=bool)
+    for T, is_drivable in tris:
+        for A, B, C in T:
+            i0, j0 = np.floor((np.minimum(np.minimum(A, B), C)[:2] - lo) / g).astype(int)
+            i1, j1 = np.ceil((np.maximum(np.maximum(A, B), C)[:2] - lo) / g).astype(int)
+            i0, j0, i1, j1 = max(i0, 0), max(j0, 0), min(i1, nx - 1), min(j1, ny - 1)
+            if i1 < i0 or j1 < j0:
+                continue
+            X, Y = np.meshgrid(lo[0] + g * np.arange(i0, i1 + 1), lo[1] + g * np.arange(j0, j1 + 1), indexing="ij")
+            d = (B[1] - C[1]) * (A[0] - C[0]) + (C[0] - B[0]) * (A[1] - C[1])
+            if abs(d) < 1e-12:
+                continue
+            l1 = ((B[1] - C[1]) * (X - C[0]) + (C[0] - B[0]) * (Y - C[1])) / d
+            l2 = ((C[1] - A[1]) * (X - C[0]) + (A[0] - C[0]) * (Y - C[1])) / d
+            l3 = 1 - l1 - l2
+            inside = (l1 >= -1e-6) & (l2 >= -1e-6) & (l3 >= -1e-6)
+            if not inside.any():
+                continue
+            z = l1 * A[2] + l2 * B[2] + l3 * C[2]
+            sub = (Zd if is_drivable else Zt)[i0:i1 + 1, j0:j1 + 1]
+            sub[inside] = np.maximum(sub[inside], z[inside])
+            if is_drivable:
+                drivable[i0:i1 + 1, j0:j1 + 1] |= inside
+    Z = np.where(drivable, Zd, Zt)
+    if env.drive_surface_smoothing > 0:  # normalised Gaussian blur over the valid nodes only
+        sig = env.drive_surface_smoothing / g
+        r = int(np.ceil(3 * sig))
+        ker = np.exp(-0.5 * (np.arange(-r, r + 1) / sig) ** 2)
+        ok = np.isfinite(Z)
+        num, den = np.where(ok, Z, 0.0), ok.astype(float)
+        for axis in (0, 1):
+            num = np.apply_along_axis(lambda v: np.convolve(v, ker, "same"), axis, num)
+            den = np.apply_along_axis(lambda v: np.convolve(v, ker, "same"), axis, den)
+        Z = np.where(ok, num / np.maximum(den, 1e-9), -np.inf)
+    k = int(round(env.drive_surface_margin / g))  # grow the drivable area by the margin
+    grown = drivable.copy()
+    for _ in range(k):
+        g2 = grown.copy()
+        g2[1:] |= grown[:-1]
+        g2[:-1] |= grown[1:]
+        g2[:, 1:] |= grown[:, :-1]
+        g2[:, :-1] |= grown[:, 1:]
+        grown = g2
+    return lo, g, Z, grown & np.isfinite(Z)
+
+
+def build_drive_surface(stage, env: LocalEnvironment, prim_path: str, path: str = "/World/DriveSurface") -> None:
+    """One seamless static collision mesh resampled from the environment's collider meshes."""
+    import hashlib
+    import time as _time
+
+    from pxr import Gf, UsdGeom, UsdPhysics, Vt
+
+    key = hashlib.sha1(repr((env.usd_path, os.path.getmtime(env.usd_path), env.origin, env.yaw_deg,
+                             env.meters_per_unit, env.collider_prims, env.terrain_prims,
+                             env.drive_surface_grid, env.drive_surface_margin, env.drive_surface_smoothing, 3)).encode()).hexdigest()[:16]
+    cache = Path(os.path.expanduser("~/.cache/talk2drive")) / f"drive_surface_{key}.npz"
+    t0 = _time.time()
+    was_cached = cache.exists()
+    if was_cached:
+        d = np.load(cache)
+        lo, g, Z, valid = d["lo"], float(d["g"]), d["Z"], d["valid"]
+    else:
+        lo, g, Z, valid = _surface_heights(stage, env, prim_path)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache, lo=lo, g=g, Z=Z, valid=valid)
+    nx, ny = Z.shape
+    vid = np.full((nx, ny), -1, dtype=np.int64)
+    vid[valid] = np.arange(int(valid.sum()))
+    I, J = np.nonzero(valid)
+    pts = np.c_[lo[0] + g * I, lo[1] + g * J, Z[I, J]]
+    a, b, c, e = vid[:-1, :-1], vid[1:, :-1], vid[1:, 1:], vid[:-1, 1:]
+    quad = (a >= 0) & (b >= 0) & (c >= 0) & (e >= 0)
+    tri = np.r_[np.c_[a[quad], b[quad], c[quad]], np.c_[a[quad], c[quad], e[quad]]]
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(pts.astype(np.float32)))
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(tri), 3, dtype=np.int32)))
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(tri.reshape(-1).astype(np.int32)))
+    mesh.CreatePurposeAttr(UsdGeom.Tokens.guide)  # collision only, never rendered
+    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+    UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr("none")
+    print(f"[env] drive surface: {len(pts)} vertices, {len(tri)} triangles at {g:.2f} m "
+          f"({'from cache' if was_cached else 'built'} in {_time.time() - t0:.1f} s)")
 
 
 def load_local_environment(stage, env: LocalEnvironment, prim_path: str = "/World/Environment") -> None:
@@ -89,18 +217,21 @@ def load_local_environment(stage, env: LocalEnvironment, prim_path: str = "/Worl
     xf.AddTransformOp().Set(m)
     xf.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "unitsResolve").Set(Gf.Vec3d(env.meters_per_unit))
 
-    n = 0
-    for rel in env.collider_prims:
-        root = stage.GetPrimAtPath(f"{prim_path}/{rel}")
-        if not root.IsValid():
-            print(f"[env] collider prim {rel} not found; skipped")
-            continue
-        for p in Usd.PrimRange(root):
-            if p.IsA(UsdGeom.Mesh):
-                UsdPhysics.CollisionAPI.Apply(p)
-                UsdPhysics.MeshCollisionAPI.Apply(p).CreateApproximationAttr("none")  # exact triangles (static)
-                n += 1
-    print(f"[env] {n} collider meshes added")
+    if env.drive_surface_grid:
+        build_drive_surface(stage, env, prim_path)
+    else:
+        n = 0
+        for rel in env.collider_prims:
+            root = stage.GetPrimAtPath(f"{prim_path}/{rel}")
+            if not root.IsValid():
+                print(f"[env] collider prim {rel} not found; skipped")
+                continue
+            for p in Usd.PrimRange(root):
+                if p.IsA(UsdGeom.Mesh):
+                    UsdPhysics.CollisionAPI.Apply(p)
+                    UsdPhysics.MeshCollisionAPI.Apply(p).CreateApproximationAttr("none")  # exact triangles (static)
+                    n += 1
+        print(f"[env] {n} collider meshes added")
 
     if env.add_sky:
         sun = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Sun"))
@@ -142,16 +273,19 @@ ROBOTS = {
         camera_prim="chassis/rgb_camera/jetbot_camera",
     ),
     # The Magna delivery robot (avesh-shah.com): built by sim/build_robot_from_fbx.py from
-    # ~/Documents/magna_robot_2wheeler.fbx with --layout trike --shell magna. Two steered front wheels
-    # (Ackermann, +-35 deg servo) 0.980 m apart, one driven rear wheel on a fixed axle 1.292 m behind
-    # them, 0.22 m wheels, roof 1.42 m, cargo bed 0.8 m, flag mast to 2.0 m; ~174 kg, 150 N m rear motor.
+    # ~/Documents/magna_robot_2wheeler.fbx with --layout trike --shell magna (command in
+    # docs/ISAAC_SIM_SETUP.md). Two steered front wheels (Ackermann servos, 60 deg joint limit) 0.980 m
+    # apart, one driven rear wheel on a fixed axle 1.292 m behind them, 0.22 m wheels, roof 1.42 m,
+    # cargo bed 0.8 m, flag mast to 2.0 m. Mass properties match the CARLA tadpole NMPC model
+    # (~/Documents/carla_nmpc_project/tadpole_params.py): 300 kg, CG 0.65 m behind the front axle and
+    # 0.45 m high, Izz ~480 kg m^2, tyre mu 0.9.
     "magna": RobotSpec(
         usd_path=str(REPO_ROOT / "assets/robots/magna_robot.usd"),
         params=dict(wheelbase=1.292, track=0.980, wheel_radius=0.22, max_speed=2.0, max_accel=1.0,
                     max_steer=math.radians(35.0), max_steer_rate=math.radians(90.0)),
         wheel_dofs=("rear_wheel_joint",),
         steer_dofs=("front_left_steer_joint", "front_right_steer_joint"),
-        steer_gains=(1500.0, 150.0),
+        steer_gains=(20000.0, 600.0),  # ~30 ms servo: the tadpole NMPC assumes direct steering
         kind="ackermann",
         spawn_height=0.03,
     ),
@@ -254,6 +388,7 @@ class IsaacJetbot:
         self.world.reset()
         self._steer_idx = (np.array([self.robot.get_dof_index(n) for n in spec.steer_dofs])
                            if spec.steer_dofs else None)
+        self.torque_mode = False
         self._restore_steering_gains()
         self._cmd = np.zeros(2)
         self._reset_encoders()
@@ -290,7 +425,49 @@ class IsaacJetbot:
         ctrl = self.robot.get_articulation_controller()
         kps, kds = (np.array(g, dtype=float) for g in ctrl.get_gains())
         kps[self._steer_idx], kds[self._steer_idx] = self.spec.steer_gains
+        if getattr(self, "torque_mode", False):  # rear motor driven by effort, not a speed target
+            kps[self.robot.wheel_dof_indices], kds[self.robot.wheel_dof_indices] = 0.0, 0.0
         ctrl.set_gains(kps=kps, kds=kds)
+
+    # ---------------------------------------------------------------- force-level actuation
+    def enable_torque_mode(self) -> None:
+        """Car-like robots: drive the rear wheel by torque and brake all wheels (see apply_forces)."""
+        if not self.is_car:
+            raise RuntimeError("torque mode is for car-like robots")
+        self.torque_mode = True
+        self._front_wheel_idx = np.array([self.robot.get_dof_index(n) for n in
+                                          ("front_left_wheel_joint", "front_right_wheel_joint")])
+        self._restore_steering_gains()
+
+    def apply_forces(self, delta: float, fx_drive: float, fx_brake: float, front_brake_frac: float = 0.65,
+                     fx_resist: float = 0.0, dt: float | None = None) -> None:
+        """Steering angle [rad] plus longitudinal tyre forces [N]: rear-wheel drive force, total brake
+        force (split front/rear) and an extra resistive force (road load) acting at the rear wheel."""
+        from isaacsim.core.utils.types import ArticulationAction
+
+        p = self.params
+        self._all_dt = dt or self.physics_dt  # time since the previous call (wheel-speed estimate)
+        delta = float(np.clip(delta, -p.max_steer, p.max_steer))
+        self._cmd = np.array([fx_drive - fx_brake, delta])
+        self.robot.apply_action(ArticulationAction(joint_positions=np.array(p.ackermann_angles(delta)),
+                                                   joint_indices=self._steer_idx))
+        q_dot = self._wheel_speed_all()  # rear, front-left, front-right [rad/s]
+        sgn = np.tanh(q_dot / 0.5)  # brakes oppose rotation, smoothly through standstill
+        r = p.wheel_radius
+        rear = fx_drive * r - (1 - front_brake_frac) * fx_brake * r * sgn[0] - fx_resist * r * sgn[0]
+        front = -0.5 * front_brake_frac * fx_brake * r * sgn[1:]
+        idx = np.r_[self.robot.wheel_dof_indices, self._front_wheel_idx]
+        self.robot.apply_action(ArticulationAction(joint_efforts=np.r_[rear, front], joint_indices=idx))
+
+    def _wheel_speed_all(self) -> np.ndarray:
+        q = np.asarray(self.robot.get_joint_positions(), dtype=float)
+        idx = np.r_[self.robot.wheel_dof_indices, self._front_wheel_idx]
+        prev = getattr(self, "_all_prev", None)
+        self._all_prev = q[idx]
+        if prev is None or len(prev) != len(idx):
+            return np.zeros(len(idx))
+        dt = getattr(self, "_all_dt", self.physics_dt)
+        return ((q[idx] - prev + np.pi) % (2 * np.pi) - np.pi) / dt
 
     def ground_height(self, x: float, y: float, default: float = 0.0) -> float:
         """Height of the scene (not the robot) below (x, y), by a physics raycast."""
@@ -328,8 +505,8 @@ class IsaacJetbot:
         self._cmd = np.array([omega_l, omega_r], dtype=float)
         self.robot.apply_wheel_actions(ArticulationAction(joint_velocities=self._cmd))
 
-    def step(self) -> None:
-        self.world.step(render=self.render)
+    def step(self, render: bool | None = None) -> None:
+        self.world.step(render=self.render if render is None else render)
         self._update_encoders()
 
     def reset_to(self, pose: tuple[float, float, float], settle_steps: int = 30) -> None:
@@ -337,6 +514,7 @@ class IsaacJetbot:
         x, y, yaw = pose
         self.world.reset()
         self._restore_steering_gains()
+        self._all_prev = None
         z = self.ground_height(x, y) + self.spec.spawn_height
         self.robot.set_world_pose(position=np.array([x, y, z]), orientation=quat_wxyz_from_yaw(yaw))
         if self.is_car:

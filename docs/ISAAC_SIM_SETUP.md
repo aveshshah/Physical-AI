@@ -108,7 +108,7 @@ adds a sun and sky (the stage has only street lamps). The road has a real crown 
 built from the FBX's wheel geometry plus a modelled shell:
 
 ```bash
-python sim/build_robot_from_fbx.py ~/Documents/magna_robot_2wheeler.fbx assets/robots/magna_robot.usd --layout trike --shell magna --chassis-mass 150 --wheel-mass 6 --max-torque 150 --drive-damping 300 --steer-stiffness 1500 --steer-damping 150 --steer-torque 200
+python sim/build_robot_from_fbx.py ~/Documents/magna_robot_2wheeler.fbx assets/robots/magna_robot.usd --layout trike --shell magna --chassis-mass 278 --wheel-mass 6 --max-torque 400 --drive-damping 300 --max-steer 60 --steer-stiffness 20000 --steer-damping 600 --steer-torque 2000 --com 0.642,0,0.45 --chassis-inertia 90,140,470
 ```
 
 Drive it with the car-like NMPC / Kanayama controllers (commands: speed and steering angle):
@@ -119,6 +119,24 @@ python sim/m1_isaac_tracking.py --robot magna --env mcity --traj roundabout --dr
 
 `--traj slalom` gives a lane change down the downtown street. Masses, motor torque and servo gains are
 assumptions (not in the FBX); change them on the build command line.
+
+## 5d. The CARLA tadpole NMPC on an Mcity route
+
+`sim/m2_mcity_tadpole_nmpc.py` drives the Magna robot round a 1.04 km lane-following loop built from
+Mcity's OpenDRIVE map, using the NMPC stack from `~/Documents/carla_nmpc_project`. That project is
+imported as-is and not edited. Its NMPC is compiled with acados, so install acados' Python template
+once:
+
+```bash
+pip install -e ~/acados/interfaces/acados_template
+```
+```bash
+python sim/m2_mcity_tadpole_nmpc.py
+```
+
+Results (metrics against that project's rules, a plot and a GIF with `--record`) go to
+`runs/mcity_tadpole_nmpc/`. The robot model matches that NMPC (300 kg, CG 0.65 m behind the front
+axle and 0.45 m high); only the wheelbase is set to the Magna's 1.292 m.
 
 ## 6. Calibrate the Jetbot model (after Isaac Sim upgrades)
 

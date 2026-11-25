@@ -114,3 +114,32 @@ def test_car_controllers_track_lane_change():
         rmse[name] = compute_metrics(log).rmse_pos_cm
     assert rmse["nmpc"] < 5.0 and rmse["kanayama"] < 15.0
     assert rmse["nmpc"] < rmse["kanayama"]
+
+
+def test_route_path_circle_curvature_and_projection():
+    import numpy as np
+
+    from talk2drive.opendrive import RoutePath
+
+    R = 20.0
+    a = np.linspace(0, 2 * np.pi, 800, endpoint=False)
+    path = RoutePath(np.c_[R * np.cos(a), R * np.sin(a)], closed=True)
+    s = np.linspace(5, path.length - 5, 50)
+    assert np.allclose(path.kappa_many(s), 1 / R, rtol=0.03)  # counter-clockwise: positive curvature
+    s0, cte = path.project(R + 0.3, 0.0, s_hint=0.0)  # 0.3 m outside the circle = right of travel
+    assert s0 < 1.0 and abs(cte + 0.3) < 0.02
+
+
+def test_opendrive_line_and_arc_sampling():
+    import xml.etree.ElementTree as ET
+
+    import numpy as np
+
+    from talk2drive.opendrive import _sample_geometry
+
+    line = ET.fromstring('<geometry s="0" x="1" y="2" hdg="0.5" length="10"><line/></geometry>')
+    p = _sample_geometry(line, 0.5)
+    assert np.allclose(p[-1, :2], [1 + 10 * np.cos(0.5), 2 + 10 * np.sin(0.5)])
+    arc = ET.fromstring('<geometry s="0" x="0" y="0" hdg="0" length="31.4159265" curvature="0.1"><arc curvature="0.1"/></geometry>')
+    q = _sample_geometry(arc, 0.5)  # half circle of radius 10, turning left
+    assert np.allclose(q[-1, :2], [0.0, 20.0], atol=1e-6) and abs(q[-1, 2] - np.pi) < 1e-6

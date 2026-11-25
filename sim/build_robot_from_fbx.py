@@ -41,7 +41,9 @@ ap.add_argument("--steer-damping", type=float, default=300.0, help="N m s per ra
 ap.add_argument("--steer-torque", type=float, default=500.0, help="N m, trike steering servo limit")
 ap.add_argument("--caster-mass", type=float, default=1.5, help="kg (diff layout caster wheel; the fork gets 0.5 kg)")
 ap.add_argument("--caster-trail", type=float, default=0.06, help="m between swivel axis and caster wheel centre")
-ap.add_argument("--tyre-friction", type=float, default=0.9)
+ap.add_argument("--tyre-friction", type=float, default=0.9, help="tyre-road friction (combine mode max, so the road's own value does not lower it)")
+ap.add_argument("--com", default=None, help="x,y,z of the chassis mass centre in the robot frame [m] (default: body centre, low)")
+ap.add_argument("--chassis-inertia", default=None, help="Ixx,Iyy,Izz of the chassis about its mass centre [kg m^2]")
 ap.add_argument("--shell", choices=["fbx", "magna"], default="fbx",
                 help="body visual: the FBX's own mesh, or a modelled Magna delivery-robot shell")
 ap.add_argument("--overall-height", type=float, default=2.0, help="m, top of the flag mast (magna shell)")
@@ -312,6 +314,8 @@ def main() -> None:
     rm.CreateStaticFrictionAttr(args.tyre_friction)
     rm.CreateDynamicFrictionAttr(args.tyre_friction * 0.9)
     rm.CreateRestitutionAttr(0.0)
+    pm = PhysxSchema.PhysxMaterialAPI.Apply(rubber.GetPrim())
+    pm.CreateFrictionCombineModeAttr("max")
 
     def link(path, pos, mass, inertia=None):
         x = UsdGeom.Xform.Define(stage, path)
@@ -388,6 +392,11 @@ def main() -> None:
     box.AddScaleOp().Set(Gf.Vec3f(*map(float, hi - lo)))
     box.CreatePurposeAttr(UsdGeom.Tokens.guide)
     UsdPhysics.CollisionAPI.Apply(box.GetPrim())
+
+    if args.com:
+        UsdPhysics.MassAPI(chassis.GetPrim()).GetCenterOfMassAttr().Set(Gf.Vec3f(*map(float, args.com.split(","))))
+    if args.chassis_inertia:
+        UsdPhysics.MassAPI(chassis.GetPrim()).CreateDiagonalInertiaAttr(Gf.Vec3f(*map(float, args.chassis_inertia.split(","))))
 
     # wheels spin about +y (left axis), so positive speed rolls the robot forward (+x)
     wheel_I = (0.5 * args.wheel_mass * radius**2, 0.25 * args.wheel_mass * radius**2 + args.wheel_mass * width**2 / 12)

@@ -79,6 +79,40 @@ to about 2 mm and NMPC's edge on the gentle figure-8 disappears. The max error (
 shifting while it settles on the ground before t = 0; after 3 s it is under 0.4 cm. Slalom and fault
 injection (M4) should separate the controllers again.
 
+## CARLA tadpole NMPC on Mcity (25 Nov 2026, `sim/m2_mcity_tadpole_nmpc.py`)
+
+The NMPC stack from the CARLA project (acados full-SQP pose/dynamics NMPC, RouteSpeedPlanner with
+stitching, force-disturbance observer, 2-DOF force split) drives the Magna robot round a 1041 m
+Mcity loop (57 OpenDRIVE roads, 3.5 m lanes, grades up to 9 %) at that project's V_MAX of 15 m/s.
+
+| Configuration | Lap | Peak / mean speed | a_x (0.2 s) | max a_y | max CTE | max heading err | steering reversals | Rules |
+|---|---|---|---|---|---|---|---|---|
+| comfort (project default) | 170.0 s | 15.1 / 6.1 m/s | +2.82 / -3.36 | 1.38 | 10.7 cm | 7.9 deg | 4 | pass |
+| sport | 140.1 s | 15.1 / 7.4 | **+3.85** / -3.42 | 1.86 | 11.6 cm | 7.5 deg | 24 | 1B fail |
+| sport + grade governor | 140.1 s | 15.1 / 7.4 | **+3.43** / -3.40 | 1.86 | 11.6 cm | 7.5 deg | 23 | 1B fail |
+| sport + governor + CG velocities | 140.1 s | 15.0 / 7.4 | +2.65 / -3.39 | 1.86 | 11.7 cm | 7.7 deg | 22 | pass |
+| **+ speed-scheduled horizon (default)** | **140.1 s** | 15.0 / 7.4 | +2.64 / -3.39 | 1.82 | 18.0 cm | 8.1 deg | **1** | **pass** |
+
+Limits: V_MAX 15 m/s (1A), +3.0 / -3.5 m/s^2 (1B), AY_MAX 3.0 m/s^2 rollover envelope, CTE 10 % of the
+lane = 35 cm and heading 15 deg (3C). The sport lap is bounded by the plan (V_MAX, 2.2 / 3.1 m/s^2,
+AY_CURVE 1.65 m/s^2), not by the controller.
+
+Findings on the way:
+
+* **Rollovers on "flat" road** were a simulator artefact: Mcity's road is several render meshes,
+  and PhysX treats the open boundary of the next mesh as a ledge, so wheels were kicked up at
+  every seam (front wheels lost contact, the robot was launched at ~2.5 m/s). The environment now
+  collides with one seamless surface resampled from those meshes (0.3 m grid, road over terrain,
+  0.45 m smoothing of cm-scale mesh offsets): `LocalEnvironment.drive_surface_grid`.
+* **Grades.** `FX_DRIVE_MAX = M * AX_ACCEL_MAX` bounds acceleration only on flat ground (CARLA
+  towns). Downhill the runner caps drive force so drive + gravity stays 0.2 m/s^2 inside 1B.
+* **Where speed is measured.** The pose point is on the ground under the rear axle, 0.45 m below
+  the CG; body pitch over a crest swings it fore-aft and read as +2 m/s^2. Velocities are now
+  taken at the CG, as the CARLA actor reports them.
+* NMPC mean solve time is 27 ms (max ~60 ms) in-process with Isaac rendering, above the 20 ms
+  tick; the simulation is synchronous so this costs wall time, not control quality, but it would
+  matter on hardware.
+
 ## What to record from each Isaac run
 
 * `runs/isaac/*_metrics.json`: compare with `runs/offline/`.
