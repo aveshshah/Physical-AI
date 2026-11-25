@@ -21,7 +21,8 @@ class RunLog:
     t: list[float] = field(default_factory=list)
     state: list[list[float]] = field(default_factory=list)  # measured [x, y, th, wl, wr]
     ref: list[list[float]] = field(default_factory=list)  # [x, y, th, v, w]
-    cmd: list[list[float]] = field(default_factory=list)  # [wl_cmd, wr_cmd]
+    cmd: list[list[float]] = field(default_factory=list)  # [wl_cmd, wr_cmd] or [v_cmd, steer_cmd]
+    command_names: tuple[str, str] = ("wl_cmd", "wr_cmd")
     solve_time: list[float] = field(default_factory=list)
     status: list[str] = field(default_factory=list)
 
@@ -62,7 +63,8 @@ def run_tracking(
     physics runs every ``robot.physics_dt`` seconds.
     """
     controller.reset()
-    log = RunLog(controller=controller.name, trajectory=traj.name)
+    log = RunLog(controller=controller.name, trajectory=traj.name,
+                 command_names=tuple(getattr(controller, "command_names", ("wl_cmd", "wr_cmd"))))
     steps_per_control = max(1, round(controller.control_dt / robot.physics_dt))
     total_steps = int(math.ceil((traj.duration + settle_time) / robot.physics_dt))
 
@@ -70,8 +72,8 @@ def run_tracking(
     for i in range(total_steps):
         if i % steps_per_control == 0:
             s = robot.get_state()
-            wl, wr = controller.compute(t, s, traj)
-            robot.set_wheel_speeds(wl, wr)
+            wl, wr = controller.compute(t, s, traj)  # (v, steer) for car-like robots
+            (robot.set_command if getattr(robot, "is_car", False) else robot.set_wheel_speeds)(wl, wr)
             r = traj.sample(t)
             log.t.append(t)
             log.state.append([float(v) for v in s])
@@ -113,8 +115,9 @@ def save_run(log: RunLog, out_dir: str | Path) -> Path:
     stem = f"{log.trajectory}_{log.controller}"
     with open(out / f"{stem}.csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["t", "x", "y", "theta", "wl", "wr", "x_ref", "y_ref", "theta_ref", "v_ref", "w_ref",
-                    "wl_cmd", "wr_cmd", "solve_ms", "status"])
+        car = log.command_names[0] == "v_cmd"
+        w.writerow(["t", "x", "y", "theta", *(("v", "steer") if car else ("wl", "wr")),
+                    "x_ref", "y_ref", "theta_ref", "v_ref", "w_ref", *log.command_names, "solve_ms", "status"])
         for i in range(len(log.t)):
             w.writerow([log.t[i], *log.state[i], *log.ref[i], *log.cmd[i], log.solve_time[i] * 1e3, log.status[i]])
     (out / f"{stem}_metrics.json").write_text(json.dumps(asdict(compute_metrics(log)), indent=2))

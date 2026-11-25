@@ -106,6 +106,11 @@ class Trajectory:
         r = self.sample(0.0)
         return r.x, r.y, r.theta
 
+    def min_turn_radius(self, n: int = 2000) -> float:
+        """Tightest radius along the path (compare with a car-like robot's minimum turn radius)."""
+        k = [abs(r.w / r.v) for r in (self.sample(t) for t in np.linspace(0, self.duration, n)) if r.v > 1e-2]
+        return 1.0 / max(k) if k and max(k) > 0 else math.inf
+
     def max_speed(self, n: int = 2000) -> float:
         return max(self.sample(t).v for t in np.linspace(0, self.duration * 0.999, n))
 
@@ -140,3 +145,23 @@ def circle(radius: float = 0.75, period: float = 25.0, laps: float = 1.0) -> Tra
 
 
 TRAJECTORIES = {"figure8": figure_eight, "slalom": slalom, "circle": circle}
+
+
+def make_trajectory(name: str, scale: float = 1.0, **overrides) -> Trajectory:
+    """A reference sized for a robot ``scale`` times the Jetbot's (1.0 = Jetbot defaults).
+
+    Lengths scale by ``scale`` and times by ``sqrt(scale)``, so speeds grow by ``sqrt(scale)`` and
+    lateral acceleration (v^2 / R) stays the same as on the Jetbot-sized path.
+    """
+    if name not in TRAJECTORIES:
+        raise ValueError(f"Unknown trajectory {name!r}; choose from {sorted(TRAJECTORIES)}")
+    if overrides:  # explicit shape parameters, e.g. a gentle slalom for a car with a 4 m turn radius
+        return TRAJECTORIES[name](**overrides)
+    if scale == 1.0:
+        return TRAJECTORIES[name]()
+    s, ts = scale, math.sqrt(scale)
+    if name == "figure8":
+        return figure_eight(size=s, period=30.0 * ts)
+    if name == "slalom":
+        return slalom(speed=0.25 * ts, amplitude=0.3 * s, wavelength=1.5 * s, length=6.0 * s)
+    return circle(radius=0.75 * s, period=25.0 * ts)

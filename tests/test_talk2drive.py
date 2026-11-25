@@ -85,3 +85,32 @@ def test_nmpc_respects_wheel_limits():
     log = run_tracking(bot, make_controller("nmpc", p), traj)
     cmds = np.abs(np.array(log.cmd))
     assert cmds.max() <= 6.0 + 1e-6
+
+
+def test_ackermann_angles_roundtrip_and_inner_wheel():
+    import math
+
+    from talk2drive import AckermannParams
+
+    p = AckermannParams(wheelbase=1.292, track=0.98)
+    for d in (-0.5, -0.1, 0.0, 0.2, 0.55):
+        left, right = p.ackermann_angles(d)
+        assert abs(p.delta_from_wheels(left, right) - d) < 1e-9
+        if d > 0:  # turning left: the left (inner) wheel steers more
+            assert left > d > right
+    assert abs(p.min_turn_radius - 1.292 / math.tan(math.radians(35))) < 1e-9
+
+
+def test_car_controllers_track_lane_change():
+    pytest.importorskip("casadi")
+    from talk2drive import AckermannParams, KinematicBicycle, compute_metrics, make_trajectory, run_tracking
+    from talk2drive.controllers import make_controller
+
+    p = AckermannParams(wheelbase=1.292, track=0.98, wheel_radius=0.22, max_speed=2.0, max_accel=1.0)
+    rmse = {}
+    for name in ("nmpc", "kanayama"):
+        tr = make_trajectory("slalom", speed=1.2, amplitude=0.8, wavelength=10.0, length=40.0)
+        log = run_tracking(KinematicBicycle(p, initial_state=tr.start_pose()), make_controller(name, p), tr)
+        rmse[name] = compute_metrics(log).rmse_pos_cm
+    assert rmse["nmpc"] < 5.0 and rmse["kanayama"] < 15.0
+    assert rmse["nmpc"] < rmse["kanayama"]

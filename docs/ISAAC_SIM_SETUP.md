@@ -12,8 +12,9 @@ Needs roughly 25–30 GB of disk (packages + extension cache + shader cache) and
 cd ~/Physical-AI
 ```
 ```bash
-python3 -m venv ~/isaac-env
+python3.12 -m venv ~/isaac-env
 ```
+(Name the version explicitly: if a conda env is active, `python3` may be an older Python.)
 ```bash
 source ~/isaac-env/bin/activate
 ```
@@ -74,7 +75,61 @@ offline run:
 python sim/m1_offline.py
 ```
 
-## 6. Running the VLM at the same time (M3 and later)
+## 5b. Mcity (University of Michigan test facility)
+
+The [Mcity digital twin](https://github.com/mcity/mcity-digital-twin) (MIT licence) ships an Omniverse
+USD version. Fetch only that folder (about 1.8 GB):
+
+```bash
+mkdir -p ~/assets && cd ~/assets
+```
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/mcity/mcity-digital-twin.git
+```
+```bash
+cd mcity-digital-twin && git sparse-checkout set Omniverse && cd ~/Physical-AI
+```
+
+Then use `--env mcity` (set `MCITY_DIR` if you put it elsewhere):
+
+```bash
+python sim/m1_isaac_tracking.py --env mcity --traj slalom --draw --view follow
+```
+
+The robot starts in the middle of the downtown north-south street (the street runs along +x). The adapter
+scales the centimetre stage to metres, adds colliders to roads, ground, sidewalks and the roundabout, and
+adds a sun and sky (the stage has only street lamps). The road has a real crown and grade of a few cm.
+
+## 5c. The Magna delivery robot (and other FBX vehicles)
+
+`assets/robots/magna_robot.usd` is the Magna delivery robot. It has two steered front wheels (Ackermann,
+±35°, position servos) 0.980 m apart, one motor-driven rear wheel on a fixed axle 1.292 m behind them, and
+0.22 m wheels. The cargo bed is at 0.8 m and the roof at 1.42 m, with the flag mast reaching 2.0 m. It is
+built from the FBX's wheel geometry plus a modelled shell:
+
+```bash
+python sim/build_robot_from_fbx.py ~/Documents/magna_robot_2wheeler.fbx assets/robots/magna_robot.usd --layout trike --shell magna --chassis-mass 150 --wheel-mass 6 --max-torque 150 --drive-damping 300 --steer-stiffness 1500 --steer-damping 150 --steer-torque 200
+```
+
+Drive it with the car-like NMPC / Kanayama controllers (commands: speed and steering angle):
+
+```bash
+python sim/m1_isaac_tracking.py --robot magna --env mcity --traj roundabout --draw --view follow
+```
+
+`--traj slalom` gives a lane change down the downtown street. Masses, motor torque and servo gains are
+assumptions (not in the FBX); change them on the build command line.
+
+## 6. Calibrate the Jetbot model (after Isaac Sim upgrades)
+
+```bash
+python sim/calibrate_jetbot.py --headless
+```
+
+It measures the effective wheel radius and wheel base and writes `runs/calib/jetbot_isaac.json`.
+If the suggested values differ from `ISAAC_JETBOT_PARAMS` in `src/talk2drive/isaac/jetbot.py`, update them.
+
+## 7. Running the VLM at the same time (M3 and later)
 
 Isaac Sim uses most of the 16 GB of VRAM. Run the assistant with the 4B model in its own terminal
 and environment:

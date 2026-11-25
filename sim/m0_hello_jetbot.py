@@ -19,7 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--env", default="grid", help="grid | warehouse | warehouse_full | room")
+ap.add_argument("--env", default="grid", help="grid | warehouse | warehouse_full | room | mcity")
+ap.add_argument("--robot", default="jetbot", help="jetbot | magna")
 ap.add_argument("--headless", action="store_true")
 ap.add_argument("--seconds", type=float, default=20.0)
 ap.add_argument("--save-every", type=float, default=1.0, help="seconds between saved camera frames")
@@ -53,7 +54,7 @@ def route(t: float) -> tuple[float, float]:
 def main() -> None:
     out = Path(args.out)
     (out / "frames").mkdir(parents=True, exist_ok=True)
-    bot = IsaacJetbot(env=args.env, render=True)
+    bot = IsaacJetbot(env=args.env, render=True, robot=args.robot)
     cam = None
     try:
         cam = bot.make_camera()
@@ -67,7 +68,11 @@ def main() -> None:
         if not app.is_running():
             break
         t = i * bot.physics_dt
-        bot.set_wheel_speeds(*bot.params.body_to_wheels(*route(t)))
+        v, w = route(t)
+        if bot.is_car:  # speed + steering; the spin-in-place segment becomes a stop
+            bot.set_command(v, np.arctan(bot.params.wheelbase * w / v) if v > 1e-3 else 0.0)
+        else:
+            bot.set_wheel_speeds(*bot.params.body_to_wheels(v, w))
         bot.step()
         s = bot.get_state()
         rows.append([t, *s])
