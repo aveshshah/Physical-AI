@@ -108,6 +108,10 @@ class TransformersBackend(VLMBackend):
         video_metadata = None
         if videos is not None:
             videos, video_metadata = map(list, zip(*videos))
+            # Newer transformers (5.x) warn unless told to use qwen-vl-utils' per-frame pixel cap.
+            # Frames are already sized by qwen-vl-utils, so opt in; older versions lack the option.
+            if hasattr(self.processor.video_processor, "cap_pixels_per_frame"):
+                video_kwargs["cap_pixels_per_frame"] = True
         inputs = self.processor(
             text=text,
             images=images,
