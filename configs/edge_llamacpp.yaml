@@ -1,0 +1,18 @@
+# Robot / edge: talk to a llama.cpp `llama-server` (or Ollama / vLLM) running Qwen3-VL.
+# The server can run on the robot itself (Jetson Orin) or on a GPU desktop on the same network.
+model:
+  backend: openai
+  base_url: http://127.0.0.1:8080/v1   # Ollama: http://127.0.0.1:11434/v1
+  model_id: qwen3-vl                   # ignored by llama-server; Ollama: e.g. qwen3-vl:8b
+  max_new_tokens: 512
+
+media:
+  image_max_side: 896
+  video_frame_max_side: 448
+  video_fps: 1.0
+  video_max_frames: 8                  # frames are sent as separate images: keep this small
+  webcam_source: 0
+
+chat:
+  max_history_turns: 8
+  keep_media_turns: 1

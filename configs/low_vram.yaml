@@ -1,0 +1,17 @@
+# 8-12 GB GPUs (RTX 3060 12GB, 4060 Ti, 4070, laptop GPUs): 4-bit NF4 via bitsandbytes.
+# Needs: pip install -e ".[quant]"
+model:
+  backend: transformers
+  model_id: Qwen/Qwen3-VL-8B-Instruct
+  dtype: bfloat16
+  quantization: 4bit
+  max_new_tokens: 768
+
+media:
+  image_max_side: 1024
+  video_frame_max_side: 448
+  video_max_frames: 16
+
+chat:
+  max_history_turns: 8
+  keep_media_turns: 1

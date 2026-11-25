@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm-assistant"
+version = "0.1.0"
+description = "Local, GPU-accelerated conversational assistant for images, webcam and video (Qwen3-VL)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "opencv-python",
+    "pyyaml",
+    "requests",
+]
+
+[project.optional-dependencies]
+# Local GPU inference. Install a CUDA build of torch first (see README).
+gpu = [
+    "torch>=2.4",
+    "torchvision",
+    "transformers>=4.57",
+    "accelerate",
+    "qwen-vl-utils>=0.0.14",
+]
+quant = ["bitsandbytes>=0.45"]
+web = ["gradio>=5"]
+dev = ["pytest"]
+
+[project.scripts]
+vlm-assistant = "vlm_assistant.cli:main"
+vlm-assistant-web = "vlm_assistant.webui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
