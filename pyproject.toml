@@ -27,6 +27,8 @@ gpu = [
 ]
 quant = ["bitsandbytes>=0.45"]
 web = ["gradio>=5"]
+# Talk-to-Drive controllers (NMPC) and plots; Isaac Sim itself is installed separately.
+sim = ["casadi>=3.6", "matplotlib"]
 dev = ["pytest"]
 
 [project.scripts]

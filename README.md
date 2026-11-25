@@ -6,6 +6,10 @@ can discuss **images, a live webcam feed and recorded videos**, built on
 machine after the one-time model download.
 
 Memory, task planning and physical actions come later. See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+**Talk-to-Drive (Isaac Sim project):** NMPC-driven Jetbot in NVIDIA Isaac Sim, guided by
+Qwen3-VL-4B. See [docs/TALK2DRIVE.md](docs/TALK2DRIVE.md) and the setup guide
+[docs/ISAAC_SIM_SETUP.md](docs/ISAAC_SIM_SETUP.md).
 The code is already split so the same perception/chat core can be moved onto a small robot.
 
 ```
