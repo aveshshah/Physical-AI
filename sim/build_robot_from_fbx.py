@@ -202,7 +202,7 @@ def build_magna_shell(stage, x_rear, x_front, roof, bed, mast_top, look) -> dict
         rings.append(np.c_[x + cx, y, np.full_like(x, z)])
     _ring_mesh(stage, "/robot/chassis/visual/shell", rings, look["white"])
 
-    def side_x(y, z_half):  # front face x at lateral offset y on the flat part of the body
+    def side_x(y):  # front face x at lateral offset y on the flat part of the body
         return cx + a * max(1 - abs(y / b_high) ** n, 0.0) ** (1 / n)
 
     def panel(name, centre, size, mat):
@@ -215,13 +215,13 @@ def build_magna_shell(stage, x_rear, x_front, roof, bed, mast_top, look) -> dict
         for k, xc in enumerate((cx - 0.5 * door_len - 0.02, cx + 0.5 * door_len + 0.02)):
             panel(f"locker_{side}_{k}", (xc - 0.08, sgn * (b_high + 0.004), (zl0 + zl1) / 2), (door_len, 0.012, zl1 - zl0), look["glass"])
     # front face
-    xf = side_x(0.0, 0) + 0.004
+    xf = side_x(0.0) + 0.004
     panel("camera_window", (xf, 0.0, roof - rt - 0.07), (0.012, 0.36, 0.17), look["glass"])
     panel("headlight", (xf, 0.0, roof - rt - 0.27), (0.012, 0.15, 0.045), look["light"])
     for sgn in (1, -1):
         y = sgn * 0.40
-        panel(f"marker_front_{'l' if sgn > 0 else 'r'}", (side_x(y, 0) + 0.004, y, roof - rt - 0.08), (0.012, 0.035, 0.11), look["amber"])
-        panel(f"taillight_{'l' if sgn > 0 else 'r'}", (2 * cx - side_x(y, 0) - 0.004, y, roof - rt - 0.08), (0.012, 0.035, 0.11), look["red"])
+        panel(f"marker_front_{'l' if sgn > 0 else 'r'}", (side_x(y) + 0.004, y, roof - rt - 0.08), (0.012, 0.035, 0.11), look["amber"])
+        panel(f"taillight_{'l' if sgn > 0 else 'r'}", (2 * cx - side_x(y) - 0.004, y, roof - rt - 0.08), (0.012, 0.035, 0.11), look["red"])
     # roof lidar, flag mast and flag
     panel("lidar", (x_front - 0.42, 0.0, roof + 0.05), (0.16, 0.24, 0.10), look["black"])
     mx, my = x_rear + 0.22, 0.30

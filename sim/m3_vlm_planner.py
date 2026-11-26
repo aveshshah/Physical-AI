@@ -28,14 +28,11 @@ react: see the obstacle, answer, and still have braking distance left.
 from __future__ import annotations
 
 import argparse
-import base64
-import io
 import json
 import math
 import os
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -72,19 +69,15 @@ from PIL import Image, ImageDraw  # noqa: E402
 
 from talk2drive.disturbances import BodyForceApplier, RoadLoadModel, parse_scenario  # noqa: E402
 from talk2drive.isaac import jetbot as J  # noqa: E402
-from talk2drive.isaac.jetbot import IsaacJetbot, drive_surface_height  # noqa: E402
+from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
 from talk2drive.isaac.props import CAM_RES, FRONT_BUMPER_X, HALF_WIDTH, footprint, make_front_camera, spawn_object  # noqa: E402
+from talk2drive.isaac.simtools import ViewportRecorder, VlmClient, chase_view, road_height  # noqa: E402
 from talk2drive.mcity import MCITY_XODR, mcity_route  # noqa: E402
 from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
 from talk2drive.vlm_planner import (FT_PROMPT, PLANNER_PROMPT, DepthGate, draw_route, locate_box, parse_plan,  # noqa: E402
                                     parse_plan_ft, shift_path)
 
 OBSTACLE_TYPES = ["brown cardboard box", "blue barrel", "red box", "orange traffic cone", "green box", "purple barrel", "yellow ball"]
-
-
-def road_h(x, y):
-    h = drive_surface_height(np.atleast_1d(x), np.atleast_1d(y))
-    return h if np.ndim(x) else float(h[0])
 
 
 def place_obstacles(rng, route, lap_length, n):
@@ -111,16 +104,6 @@ def place_obstacles(rng, route, lap_length, n):
             side = 1.0 if rng.random() < 0.5 else -1.0
             objs.append(dict(name="orange traffic cone", s=s + float(rng.uniform(-1, 1)), xy=c + (lat + side * 1.8) * nrm, role="side"))
     return objs
-
-
-def ask_vlm(img: Image.Image, prompt: str) -> dict:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    req = urllib.request.Request(args.vlm_url + "/ground", method="POST", headers={"Content-Type": "application/json"},
-                                 data=json.dumps({"image_png_b64": base64.b64encode(buf.getvalue()).decode(), "query": "",
-                                                  "prompt": prompt}).encode())
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return json.loads(r.read())
 
 
 def read_plan(raw: str) -> dict | None:
@@ -172,13 +155,34 @@ def paved_ok(path, span: float, side: float) -> bool:
 COMMIT_DIST = 18.0  # within this of the blocker, a side flip needs the depth camera to agree [m]
 
 
+def choose_swerve(route, s_route, cte_route, s_b, r_b, off, v, gate, vetoes):
+    """The swerve to drive round a blocker at ``s_b`` (radius ``r_b``): the VLM's signed offset ``off``
+    first, widened in 0.4 m steps if the depth camera says it is too tight, then the other side.
+    Every candidate must keep the robot on pavement. Returns (offset, path, span) or None."""
+    pts = gate.obstacle_points() if gate is not None else None
+    if gate is not None:
+        cands = [np.sign(off) * (abs(off) + k * 0.4) for k in range(4)]
+        cands += [-np.sign(off) * (max(abs(off), 0.8) + k * 0.4) for k in range(4)]
+    else:
+        cands = [off]
+    for o in cands:
+        lp, span = shift_path(route, s_route, cte_route, s_b, r_b, o, max(v, 4.0))
+        if not paved_ok(lp, span, o):
+            vetoes["off_pavement"] += 1
+            continue
+        if gate is None or gate.first_blocked(lp, 0.0, min(lp.length, span + 5.0), pts) is None:
+            return o, lp, span
+    return None
+
+
 def main() -> None:
     out = (REPO / args.out) if not os.path.isabs(args.out) else Path(args.out)
     (out / "looks").mkdir(parents=True, exist_ok=True)
     for f in (out / "looks").glob("*.jpg"):
         f.unlink()
+    vlm = VlmClient(args.vlm_url)
     try:
-        health = json.loads(urllib.request.urlopen(args.vlm_url + "/health", timeout=5).read())
+        health = vlm.health()
     except OSError as e:
         sys.exit(f"[m3p] VLM service not reachable at {args.vlm_url} ({e}); start scripts/vlm_ground_server.py")
     print(f"[m3p] VLM: {health['model']}, prompt {args.prompt}; gate {'off' if args.no_gate else 'on'}")
@@ -206,23 +210,15 @@ def main() -> None:
     loads = RoadLoadModel(parse_scenario("nominal"), P, lap_length, dt=TS)
     driver = TadpoleDriver(stack, bot, loads, BodyForceApplier("/World/Jetbot/chassis"))
     driver.set_path(route, 0.0)
-    gate = None if args.no_gate else DepthGate(cam, road_h, half_width=HALF_WIDTH)
+    gate = None if args.no_gate else DepthGate(cam, road_height, half_width=HALF_WIDTH)
     vetoes = {"offset_widened": 0, "off_pavement": 0, "flip_kept": 0, "side_corrected": 0, "no_side_stop": 0}  # depth checks on the VLM's swerves
-    from isaacsim.core.utils.viewports import set_camera_view
-
     try:
         from isaacsim.util.debug_draw import _debug_draw
 
         draw = _debug_draw.acquire_debug_draw_interface()
     except ImportError:
         draw = None
-    if args.record:
-        from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
-
-        vp = get_active_viewport()
-        (out / "frames").mkdir(exist_ok=True)
-        for f in (out / "frames").glob("*.png"):
-            f.unlink()
+    recorder = ViewportRecorder(out / "frames", 0.5) if args.record else None
 
     a_brake = float(P.AX_DECEL_CMD)
     keys = ("t", "x", "y", "psi", "vx", "v_ref", "s_route", "cte_route", "delta_cmd", "v_cap", "gate", "on_shift", "clear_min")
@@ -234,7 +230,7 @@ def main() -> None:
     vlm_stop = None  # (s_route where the robot must stop)
     gate_events, gate_active = 0, False
     min_clear = [float("inf")] * len(objs)
-    k, n_frame, hit = 0, 0, None
+    k, hit = 0, None
     wall0 = time.perf_counter()
     while k * TS < args.max_time and app.is_running():
         t = k * TS
@@ -250,8 +246,8 @@ def main() -> None:
             depth = np.asarray(cam.get_depth(), dtype=float).copy()
             ss = np.arange(s_route + 2.0, min(s_route + 45.0, route.length), 0.5)
             R = route.xy[(ss / route.ds).astype(int)]
-            im = draw_route(Image.fromarray(rgb), cam, np.c_[R, road_h(R[:, 0], R[:, 1]) + 0.02], depth)
-            ans = ask_vlm(im, prompt)
+            im = draw_route(Image.fromarray(rgb), cam, np.c_[R, road_height(R[:, 0], R[:, 1]) + 0.02], depth)
+            ans = vlm.ask(im, prompt=prompt)
             plan = read_plan(ans.get("raw", ""))
             last_latency = ans.get("ms", 1000.0) / 1000.0
             blk_xy = None
@@ -293,19 +289,7 @@ def main() -> None:
                             same = True
                             vetoes["flip_kept"] += 1
                     if not same and s_b > s_route:
-                        pts = gate.obstacle_points() if gate is not None else None
-                        chosen = None
-                        # the VLM's side first, widened in 0.4 m steps if the depth camera says it is too tight; then the other side
-                        cands = [np.sign(off) * (abs(off) + k * 0.4) for k in range(4)]
-                        cands += [-np.sign(off) * (max(abs(off), 0.8) + k * 0.4) for k in range(4)]
-                        for o in (cands if gate is not None else [off]):
-                            lp, span = shift_path(route, s_route, cte_route, s_b, blk[1], o, max(vx_now, 4.0))
-                            if not paved_ok(lp, span, o):
-                                vetoes["off_pavement"] += 1
-                                continue
-                            if gate is None or gate.first_blocked(lp, 0.0, min(lp.length, span + 5.0), pts) is None:
-                                chosen = (o, lp, span)
-                                break
+                        chosen = choose_swerve(route, s_route, cte_route, s_b, blk[1], off, vx_now, gate, vetoes)
                         if chosen is None:  # neither side passes: stop short of the blocker
                             vlm_stop = s_b - blk[1] - 0.8 - FRONT_BUMPER_X
                             vetoes["no_side_stop"] += 1
@@ -363,18 +347,15 @@ def main() -> None:
         if draw is not None:
             draw.clear_lines()
             pts = cur_path.xy[::6]
-            zz = road_h(pts[:, 0], pts[:, 1]) + 0.08
+            zz = road_height(pts[:, 0], pts[:, 1]) + 0.08
             P3 = [(float(a), float(b), float(c)) for (a, b), c in zip(pts, zz) if np.isfinite(c)]
             col = (1.0, 0.2, 1.0, 1) if shift else (0.1, 0.9, 0.2, 1)
             if len(P3) > 1:
                 draw.draw_lines(P3[:-1], P3[1:], [col] * (len(P3) - 1), [3] * (len(P3) - 1))
         if not args.headless:
-            z = bot.ground_height(X, Y)
-            set_camera_view(eye=[X - 7.5 * math.cos(psi), Y - 7.5 * math.sin(psi), z + 3.8],
-                            target=[X + 7 * math.cos(psi), Y + 7 * math.sin(psi), z + 0.5])
-        if args.record and t + 1e-9 >= n_frame * 0.5:
-            capture_viewport_to_file(vp, file_path=str(out / "frames" / f"{n_frame:04d}.png"))
-            n_frame += 1
+            chase_view(X, Y, psi, bot.ground_height(X, Y), 7.5, 3.8, 7, 0.5)
+        if recorder is not None:
+            recorder.capture(t)
         driver.step(render=True)
         k += 1
         if s_route >= lap_length - 1.0 and abs(row["vx"]) < 0.05 and shift is None:
@@ -421,13 +402,8 @@ def main() -> None:
     for p in per_obj:
         print(f"[m3p]   {p['name']:20s} {p['role']:7s} s={p['s']:5.0f}  min clearance {p['min_clearance_m']:5.2f} m  "
               f"gate braked {p['gate_braked']!s:5s}  VLM said {p['vlm_actions']}")
-    if args.record:
-        for _ in range(10):
-            app.update()
-        files = sorted((out / "frames").glob("*.png"))
-        if files:
-            imgs = [Image.open(f).convert("RGB").resize((640, 360)) for f in files]
-            imgs[0].save(out / "run.gif", save_all=True, append_images=imgs[1:], duration=125, loop=0)
+    if recorder is not None:
+        recorder.save_gif(app, out / "run.gif", 125)
     app.close()
 
 

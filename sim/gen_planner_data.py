@@ -45,18 +45,15 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from talk2drive.isaac import jetbot as J  # noqa: E402
-from talk2drive.isaac.jetbot import IsaacJetbot, drive_surface_height, quat_wxyz_from_yaw  # noqa: E402
+from talk2drive.isaac.jetbot import IsaacJetbot, quat_wxyz_from_yaw  # noqa: E402
 from talk2drive.isaac.props import CAM_RES, CATALOG, FRONT_BUMPER_X, HALF_WIDTH, footprint, make_front_camera, object_height, spawn_object  # noqa: E402
+from talk2drive.isaac.simtools import road_height  # noqa: E402
 from talk2drive.mcity import MCITY_XODR, mcity_route  # noqa: E402
 from talk2drive.vlm_planner import draw_route  # noqa: E402
 
 CLEAR = 0.6  # clearance kept from the blocker when passing [m]
 BLOCK_EDGE = HALF_WIDTH + 0.5  # an object whose edge is this close to the route is in the way
 POOL = 3  # prims per object type
-
-
-def road_h(x, y):
-    return drive_surface_height(np.atleast_1d(x), np.atleast_1d(y))
 
 
 def paved_extent(route, s: float) -> tuple[float, float]:
@@ -135,12 +132,12 @@ def main() -> None:
     def place(prim, name, xy):
         zc = object_height(name) / 2
         op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
-        op.Set(Gf.Vec3d(float(xy[0]), float(xy[1]), float(road_h(*xy)[0]) + zc))
+        op.Set(Gf.Vec3d(float(xy[0]), float(xy[1]), float(road_height(*xy)[0]) + zc))
         UsdGeom.Imageable(prim).MakeVisible()
 
     def gt_box(name, xy):
         r, h = footprint(name), object_height(name)
-        z0 = float(road_h(*xy)[0])
+        z0 = float(road_height(*xy)[0])
         corners = np.array([[xy[0] + dx, xy[1] + dy, z0 + dz] for dx in (-r, r) for dy in (-r, r) for dz in (0.0, h)])
         uv = np.asarray(cam.get_image_coords_from_world_points(corners), dtype=float)
         (u0, v0), (u1, v1) = uv.min(axis=0), uv.max(axis=0)
@@ -203,7 +200,7 @@ def main() -> None:
             hdo = route.heading(o["s"])
             o["xy"] = c + o["lat"] * np.array([-math.sin(hdo), math.cos(hdo)])
             place(pool[o["name"]][k], o["name"], o["xy"])
-        z = float(road_h(*p)[0]) + 0.02
+        z = float(road_height(*p)[0]) + 0.02
         bot.robot.set_world_pose(position=np.array([p[0], p[1], z]), orientation=quat_wxyz_from_yaw(yaw))
         bot.robot.set_linear_velocity(np.zeros(3))
         bot.robot.set_angular_velocity(np.zeros(3))
@@ -215,7 +212,7 @@ def main() -> None:
             continue
         ss = np.arange(s_r + 2.0, s_r + 45.0, 0.5)
         R = route.xy[np.clip((ss / route.ds).astype(int), 0, len(route.xy) - 1)]
-        im = draw_route(Image.fromarray(rgb.copy()), cam, np.c_[R, road_h(R[:, 0], R[:, 1]) + 0.02], depth)
+        im = draw_route(Image.fromarray(rgb.copy()), cam, np.c_[R, road_height(R[:, 0], R[:, 1]) + 0.02], depth)
         im = im.resize((960, 540))
         name = f"{i:05d}.jpg"
         im.save(out / "images" / name, quality=92)

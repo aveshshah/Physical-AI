@@ -41,8 +41,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--nmpc-dir", default=os.path.expanduser("~/Documents/carla_nmpc_project"))
-ap.add_argument("--xodr", default=os.path.expanduser(
-    "~/assets/mcity-digital-twin/Omniverse/Collected_McityMap_NSR_v4_1_6/mcity_map_v6_nvidia.xodr"))
+ap.add_argument("--xodr", default=None, help="Mcity OpenDRIVE map (default: talk2drive.mcity.MCITY_XODR)")
 ap.add_argument("--route-start", default="104,1", help="road id,direction (+1 along the road's s)")
 ap.add_argument("--route-seed", type=int, default=1)
 ap.add_argument("--v-max", type=float, default=15.0, help="NMPC_V_MAX [m/s]")
@@ -82,19 +81,10 @@ import numpy as np  # noqa: E402
 
 from talk2drive.disturbances import BodyForceApplier, RoadLoadModel, apply_road_friction, parse_scenario  # noqa: E402
 from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
-from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
-from talk2drive.mcity import mcity_route  # noqa: E402
+from talk2drive.isaac.simtools import ViewportRecorder, chase_view  # noqa: E402
+from talk2drive.mcity import MCITY_XODR, mcity_route  # noqa: E402
 from talk2drive.opendrive import RoutePath  # noqa: E402
-
-def make_chase_camera(bot):
-    from isaacsim.core.utils.viewports import set_camera_view
-
-    def update(x, y, psi):
-        z = float(bot.robot.get_world_pose()[0][2])
-        c, s = math.cos(psi), math.sin(psi)
-        set_camera_view(eye=[x - 7.0 * c, y - 7.0 * s, z + 3.2], target=[x + 4.0 * c, y + 4.0 * s, z + 0.6])
-
-    return update
+from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
 
 
 def score(log: dict, P, lane_width: float, lap_length: float) -> dict:
@@ -298,7 +288,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     stack = load_tadpole_stack(args.nmpc_dir, out / "solver_build", ay_curve=args.ay_curve)
     P = stack.P
-    path, lap_length, (lane_width,), route = mcity_route(args.xodr, args.route_start, args.route_seed)
+    path, lap_length, (lane_width,), route = mcity_route(args.xodr or MCITY_XODR, args.route_start, args.route_seed)
     print(f"[m2] route: {len(route)} roads, lap {lap_length:.0f} m, lane width {lane_width:.2f} m; "
           f"V_MAX {P.V_MAX:g} m/s, style {P.DRIVE_STYLE}, AY_CURVE {P.AY_CURVE:.2f}, AY_MAX {P.AY_MAX:.2f} m/s^2")
 
@@ -347,16 +337,7 @@ def main() -> None:
                 print(f"[contact] t={t:6.2f} {pair[0].replace('/World/','')} <-> {pair[1].replace('/World/','')} "
                       f"n={len(pts)} impulse={imp:7.2f} N s sep={sep*100:+.1f} cm normal=({nrm[0]:+.2f},{nrm[1]:+.2f},{nrm[2]:+.2f}) "
                       f"at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
-    camera = make_chase_camera(bot)
-
-    frames = out / "frames"
-    if args.record:
-        frames.mkdir(exist_ok=True)
-        for f in frames.glob("*.png"):
-            f.unlink()
-        from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
-
-        vp = get_active_viewport()
+    recorder = ViewportRecorder(out / "frames", args.record_every) if args.record else None
 
     keys = ("t", "x", "y", "psi", "vx", "vy", "r", "delta", "delta_cmd", "fx_drive", "fx_brake", "s", "cte", "epsi",
             "v_ref", "status", "solve_ms", "dF", "roll", "pitch", "z",
@@ -366,7 +347,6 @@ def main() -> None:
     log = {k: [] for k in keys}
     driver = TadpoleDriver(stack, bot, loads, body_forces, grade_governor=not args.no_grade_governor)
     driver.set_path(path, s_hint=args.start_s)
-    n_frame = 0
     s_stop = lap_length
     wall0 = time.perf_counter()
     k = 0
@@ -384,10 +364,9 @@ def main() -> None:
                   f"solve={row['solve_ms']:4.1f} ms status={row['status']}")
 
         if not args.headless:
-            camera(row["x"], row["y"], row["psi"])
-        if args.record and t + 1e-9 >= n_frame * args.record_every:
-            capture_viewport_to_file(vp, file_path=str(frames / f"{n_frame:04d}.png"))
-            n_frame += 1
+            chase_view(row["x"], row["y"], row["psi"], float(bot.robot.get_world_pose()[0][2]), 7.0, 3.2, 4.0, 0.6)
+        if recorder is not None:
+            recorder.capture(t)
         driver.step(render=not args.headless or args.record)
         if contact_reader is not None:
             contact_reader(t)
@@ -411,17 +390,8 @@ def main() -> None:
     plot_disturbance(log, P, out, metrics, args.baseline)
     print("[m2] " + json.dumps({k_: v for k_, v in metrics.items() if k_ != "route_roads"}, indent=1))
     print(f"[m2] plot {fig}  ({k * TS:.0f} s simulated in {wall:.0f} s)")
-    if args.record:
-        for _ in range(10):
-            app.update()
-        from PIL import Image
-
-        files = sorted(frames.glob("*.png"))
-        if files:
-            imgs = [Image.open(f).convert("RGB").resize((640, 360)) for f in files]
-            gif = out / "lap.gif"
-            imgs[0].save(gif, save_all=True, append_images=imgs[1:], duration=round(1000 * args.record_every / 4), loop=0)
-            print(f"[m2] recording {gif} (4x real time)")
+    if recorder is not None and recorder.save_gif(app, out / "lap.gif", round(1000 * args.record_every / 4)):
+        print(f"[m2] recording {out / 'lap.gif'} (4x real time)")
     app.close()
 
 

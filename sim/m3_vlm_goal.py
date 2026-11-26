@@ -20,14 +20,10 @@ from the real one, and where did the robot stop relative to the intended stop po
 from __future__ import annotations
 
 import argparse
-import base64
-import io
 import json
 import math
 import os
 import sys
-import time
-import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -45,8 +41,7 @@ ap.add_argument("--relook", type=float, default=1.5, help="seconds between VLM l
 ap.add_argument("--relook-until", type=float, default=9.0, help="stop re-looking within this distance of the object [m]")
 ap.add_argument("--v-max", type=float, default=15.0)
 ap.add_argument("--nmpc-dir", default=os.path.expanduser("~/Documents/carla_nmpc_project"))
-ap.add_argument("--xodr", default=os.path.expanduser(
-    "~/assets/mcity-digital-twin/Omniverse/Collected_McityMap_NSR_v4_1_6/mcity_map_v6_nvidia.xodr"))
+ap.add_argument("--xodr", default=None, help="Mcity OpenDRIVE map (default: talk2drive.mcity.MCITY_XODR)")
 ap.add_argument("--start-s", type=float, default=15.0, help="start this far along the Mcity route [m]")
 ap.add_argument("--headless", action="store_true")
 ap.add_argument("--out", default="runs/m3")
@@ -66,46 +61,16 @@ from PIL import Image, ImageDraw  # noqa: E402
 
 from talk2drive.disturbances import BodyForceApplier, RoadLoadModel, parse_scenario  # noqa: E402
 from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
+from talk2drive.isaac.props import CAM_RES, CATALOG, FRONT_BUMPER_X, footprint, make_front_camera, spawn_object  # noqa: E402
+from talk2drive.isaac.simtools import VlmClient, chase_view  # noqa: E402
+from talk2drive.mcity import MCITY_XODR, mcity_lap  # noqa: E402
 from talk2drive.opendrive import RoutePath  # noqa: E402
 from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
-from talk2drive.isaac.props import CAM_RES, CATALOG, FRONT_BUMPER_X, footprint, spawn_object  # noqa: E402
-from talk2drive.isaac.props import make_front_camera as make_camera  # noqa: E402
+from talk2drive.vlm_planner import locate_box  # noqa: E402
 from vlm_assistant.grounding import to_pixels  # noqa: E402
 
+
 # ---------------------------------------------------------------- perception
-def ask_vlm(rgb: np.ndarray, query: str) -> dict:
-    buf = io.BytesIO()
-    Image.fromarray(rgb).save(buf, format="PNG")
-    req = urllib.request.Request(args.vlm_url + "/ground", method="POST", headers={"Content-Type": "application/json"},
-                                 data=json.dumps({"image_png_b64": base64.b64encode(buf.getvalue()).decode(), "query": query}).encode())
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())
-
-
-def locate(cam, depth: np.ndarray, box_px) -> tuple[np.ndarray, float] | None:
-    """World position (ground plane) of the object in a pixel box, and its estimated radius.
-
-    Depth: median over the middle of the box (edges often catch the road behind). The box centre at that
-    depth is the object's front surface; push it back by half the object's width (from the box width)."""
-    x1, y1, x2, y2 = box_px
-    w, h = x2 - x1, y2 - y1
-    if w < 2 or h < 2:
-        return None
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    sub = depth[int(cy - 0.2 * h):int(cy + 0.2 * h) + 1, int(cx - 0.2 * w):int(cx + 0.2 * w) + 1]
-    sub = sub[np.isfinite(sub) & (sub > 0.1)]
-    if sub.size == 0:
-        return None
-    d = float(np.median(sub))
-    p = cam.get_world_points_from_image_coords(np.array([[cx, cy]]), np.array([d]))[0]
-    fx = float(cam.get_intrinsics_matrix()[0, 0])
-    radius = 0.5 * w * d / fx
-    cam_pos = np.asarray(cam.get_world_pose()[0], dtype=float)
-    ray = p[:2] - cam_pos[:2]
-    ray /= max(np.linalg.norm(ray), 1e-6)
-    return p[:2] + radius * ray, radius
-
-
 def gt_box(cam, prim) -> tuple[float, float, float, float] | None:
     """Ground-truth 2D box of an object (its 3D bounding box corners projected into the image)."""
     from pxr import Usd, UsdGeom
@@ -177,8 +142,9 @@ def scenario_layout(rng, start_path, s_start):
 def main() -> None:
     out = (REPO / args.out) if not os.path.isabs(args.out) else Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    vlm = VlmClient(args.vlm_url)
     try:
-        health = json.loads(urllib.request.urlopen(args.vlm_url + "/health", timeout=5).read())
+        health = vlm.health()
     except OSError as e:
         sys.exit(f"[m3] grounding service not reachable at {args.vlm_url} ({e}); start scripts/vlm_ground_server.py")
     print(f"[m3] VLM: {health['model']}")
@@ -186,24 +152,14 @@ def main() -> None:
     stack = load_tadpole_stack(args.nmpc_dir, out / "solver_build", ay_curve=2.4)
     P = stack.P
     TS = float(P.NMPC_TS)
-    # the start of the Mcity lap route used by m2 (long straight)
-    from talk2drive.isaac.jetbot import LOCAL_ENVIRONMENTS
-    from talk2drive.opendrive import OpenDrive
-
-    od = OpenDrive(args.xodr)
-    route = od.find_loop(("104", 1), min_length=500, max_length=1100, tries=3000, seed=1)
-    pts, _ = od.route_points(route)
-    env = LOCAL_ENVIRONMENTS["mcity"]
-    c, s_ = math.cos(math.radians(env.yaw_deg)), math.sin(math.radians(env.yaw_deg))
-    q = pts - np.asarray(env.origin[:2])
-    road = RoutePath(np.c_[c * q[:, 0] - s_ * q[:, 1], s_ * q[:, 0] + c * q[:, 1]], closed=True)
+    road, _, _ = mcity_lap(args.xodr or MCITY_XODR, "104,1", 1)  # the m2 lap; it starts on a long straight
 
     x0, y0 = road.xy[int(args.start_s / road.ds)]
     psi0 = road.heading(args.start_s)
     bot = IsaacJetbot(env="mcity", robot=args.robot, physics_dt=TS / 2, start_pose=(x0, y0, psi0), render=True)
     bot.enable_torque_mode()
     bot.params.max_steer = float(np.deg2rad(P.MAX_STEER_DEG))
-    cam = make_camera(bot)
+    cam = make_front_camera(bot)
     loads = RoadLoadModel(parse_scenario("nominal"), P, 100.0, dt=TS)
     body_forces = BodyForceApplier("/World/Jetbot/chassis")
     driver = TadpoleDriver(stack, bot, loads, body_forces)
@@ -213,8 +169,6 @@ def main() -> None:
         draw = _debug_draw.acquire_debug_draw_interface()
     except ImportError:
         draw = None
-    from isaacsim.core.utils.viewports import set_camera_view
-
     rng = np.random.default_rng(args.seed)
     results = []
     stage = bot.world.stage
@@ -238,12 +192,12 @@ def main() -> None:
         def look(t, tag):
             rgb = np.asarray(cam.get_rgba())[:, :, :3].astype(np.uint8)
             depth = np.asarray(cam.get_depth(), dtype=float)
-            ans = ask_vlm(rgb, query)
+            ans = vlm.ask(Image.fromarray(rgb), query, timeout=120)
             boxes = ans.get("boxes", [])
             est = None
             box_px = to_pixels(boxes[0]["bbox_2d"], CAM_RES[0], CAM_RES[1]) if boxes else None
             if box_px is not None:
-                est = locate(cam, depth, box_px)
+                est = locate_box(cam, depth, box_px)
             im = Image.fromarray(rgb)
             dr = ImageDraw.Draw(im)
             gtb = gt_box(cam, stage.GetPrimAtPath("/World/M3Objects/obj0"))
@@ -291,9 +245,7 @@ def main() -> None:
                 draw.draw_lines(pp[:-1], pp[1:], [(0.1, 0.9, 0.2, 1)] * (len(pp) - 1), [3] * (len(pp) - 1))
                 draw.draw_points([(float(goal_obj[0]), float(goal_obj[1]), zz + 1.2)], [(1, 0, 1, 1)], [18])
             if not args.headless:
-                th = row["psi"]
-                set_camera_view(eye=[row["x"] - 6.5 * math.cos(th), row["y"] - 6.5 * math.sin(th), bot.ground_height(row["x"], row["y"]) + 3.4],
-                                target=[row["x"] + 6 * math.cos(th), row["y"] + 6 * math.sin(th), bot.ground_height(row["x"], row["y"]) + 0.5])
+                chase_view(row["x"], row["y"], row["psi"], bot.ground_height(row["x"], row["y"]), 6.5, 3.4, 6, 0.5)
             driver.step(render=True)
             k += 1
             for n, xy in objs:  # contact with any object (centre distance below footprint + half the pod width)

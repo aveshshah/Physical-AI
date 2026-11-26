@@ -1,11 +1,11 @@
-"""Qwen3-VL as behaviour + local planner; the NMPC tracks what it draws; a depth gate can only brake.
+"""Qwen3-VL as behaviour + local planner; the NMPC tracks the swerve it asks for; a depth gate can only brake.
 
 Each look:
-  camera image with the route ahead painted on the road (green)
-  -> VLM: {"action": follow | bypass_left | bypass_right | stop, "waypoints": [[u, v], ...] (0..1000,
-     image coordinates of points on the road surface, near to far), "obstacles": [...], "reason": "..."}
-  -> each waypoint's camera ray intersected with the road surface -> world waypoints
-  -> local path: robot -> waypoints -> back onto the route, handed to the NMPC
+  camera image with the route ahead painted on the road (green, hidden behind objects: draw_route)
+  -> VLM: {"action": follow | bypass_left | bypass_right | stop, "offset_m": ..., "blocker": {label, bbox_2d}}
+     (FT_PROMPT, fine-tuned model) or the longer zero-shot PLANNER_PROMPT (parse_plan)
+  -> the blocker's box and the depth image put it on the map (locate_box)
+  -> shift_path: a smooth sideways shift to ``offset_m`` past the blocker and back, handed to the NMPC
 
 The gate (DepthGate) runs every few ticks on the depth image, independent of the VLM: points standing
 above the road inside the robot's corridor along the current path, within stopping distance, make it
@@ -105,27 +105,6 @@ def camera_rays(cam, uv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return origin, d / np.linalg.norm(d, axis=1, keepdims=True)
 
 
-def pixels_to_road(cam, uv: np.ndarray, road_height, max_range: float = 60.0) -> np.ndarray:
-    """Where the camera rays through ``uv`` meet the road (n, 2); NaN rows if they miss within range."""
-    o, d = camera_rays(cam, uv)
-    out = np.full((len(uv), 2), np.nan)
-    for i, di in enumerate(d):
-        if di[2] >= -1e-3:
-            continue  # at or above the horizon
-        z0 = road_height(o[0], o[1])
-        t = (o[2] - (z0 if np.isfinite(z0) else o[2] - 1.45)) / -di[2]
-        for _ in range(4):  # refine against the local road height (grades)
-            p = o + t * di
-            zg = road_height(p[0], p[1])
-            if not np.isfinite(zg):
-                break
-            t = (o[2] - zg) / -di[2]
-        if 0 < t * math.hypot(di[0], di[1]) <= max_range:
-            p = o + t * di
-            out[i] = p[:2]
-    return out
-
-
 def project_to_image(cam, pts_xyz: np.ndarray, width: int, height: int) -> np.ndarray:
     """Pixel coordinates of world points in front of the camera (rows NaN otherwise)."""
     o = np.asarray(cam.get_world_pose()[0], dtype=float)
@@ -159,40 +138,6 @@ def draw_route(image, cam, route_xyz: np.ndarray, depth: np.ndarray, color=(0, 2
 
 
 # ---------------------------------------------------------------- paths
-def local_path(route, s_route: float, pose, wps_world: np.ndarray, rejoin: float = 8.0, tail: float = 60.0):
-    """Robot pose -> VLM waypoints -> back onto ``route`` ``rejoin`` m past the last waypoint, then
-    ``tail`` m along the route. Waypoints behind the robot or going backwards are dropped."""
-    from talk2drive.opendrive import RoutePath
-
-    x, y, psi = pose
-    h = np.array([math.cos(psi), math.sin(psi)])
-    pts = [np.array([x, y]), np.array([x, y]) + 1.5 * h]
-    s_last = s_route
-    for w in wps_world:
-        if not np.all(np.isfinite(w)):
-            continue
-        if (w - pts[-1]) @ h < 1.0 and len(pts) > 2:
-            continue
-        if (w - np.array([x, y])) @ h < 2.5:
-            continue  # too close to steer to
-        s_w = route.project(w[0], w[1], s_last, window=40.0)[0]
-        if s_w < s_last - 0.5:
-            continue
-        pts.append(w)
-        s_last = s_w
-    s_join = s_last + rejoin
-    i0, i1 = int(s_join / route.ds), int(min(route.length, s_join + tail) / route.ds)
-    P = np.r_[np.array(pts), route.xy[i0:i1]]
-    # Catmull-Rom through the points, then the uniform resampling / smoothing of RoutePath
-    Q = [P[0]]
-    for k in range(len(P) - 1):
-        p0, p1, p2, p3 = P[max(k - 1, 0)], P[k], P[k + 1], P[min(k + 2, len(P) - 1)]
-        n = max(2, int(np.linalg.norm(p2 - p1) / 0.2))
-        for tt in np.linspace(0, 1, n)[1:]:
-            Q.append(0.5 * ((2 * p1) + (-p0 + p2) * tt + (2 * p0 - 5 * p1 + 4 * p2 - p3) * tt**2 + (-p0 + 3 * p1 - 3 * p2 + p3) * tt**3))
-    return RoutePath(np.array(Q), smooth_m=1.0), len(pts) - 2
-
-
 def _quintic(u: np.ndarray) -> np.ndarray:
     u = np.clip(u, 0.0, 1.0)
     return u**3 * (10 - 15 * u + 6 * u * u)

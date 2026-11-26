@@ -68,13 +68,12 @@ def run(robot: str) -> dict:
     # steady turn: ramp to 6 m/s on R = 12 m, then measure
     R, v = 12.0, 6.0
     delta = math.atan(bot.params.wheelbase / R)
-    rolls, ays = [], []
+    rolls = []
     for i in range(int(14.0 / DT)):
         bot.set_command(min(v, 0.6 * i * DT), delta)
         bot.step()
         if i * DT > 9.0:
-            p0, roll, yaw0 = pose(bot)
-            rolls.append(roll)
+            rolls.append(pose(bot)[1])
     w = v / R
     ay = v * w
     res["steady_turn"] = {"speed": v, "radius": R, "a_y": ay, "roll_deg": round(math.degrees(float(np.mean(rolls))), 2),

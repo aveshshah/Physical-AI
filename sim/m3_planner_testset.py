@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -38,16 +37,13 @@ app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720})
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from talk2drive.isaac.jetbot import IsaacJetbot, drive_surface_height  # noqa: E402
-from talk2drive.isaac.props import CAM_RES, make_front_camera, spawn_object  # noqa: E402
+from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
+from talk2drive.isaac.props import make_front_camera, spawn_object  # noqa: E402
+from talk2drive.isaac.simtools import road_height  # noqa: E402
 from talk2drive.mcity import MCITY_XODR, mcity_route  # noqa: E402
 from talk2drive.vlm_planner import draw_route  # noqa: E402
 
 BLOCKERS = ["brown cardboard box", "blue barrel", "red box", "green box", "purple barrel", "yellow ball"]
-
-
-def road_h(x, y):
-    return drive_surface_height(np.atleast_1d(x), np.atleast_1d(y))
 
 
 def main() -> None:
@@ -92,7 +88,7 @@ def main() -> None:
             rgb = np.asarray(cam.get_rgba())[:, :, :3].astype(np.uint8).copy()
             ss = np.arange(s_r + 2.0, s_r + 45.0, 0.5)
             R = route.xy[(ss / route.ds).astype(int)]
-            im = draw_route(Image.fromarray(rgb), cam, np.c_[R, road_h(R[:, 0], R[:, 1]) + 0.02],
+            im = draw_route(Image.fromarray(rgb), cam, np.c_[R, road_height(R[:, 0], R[:, 1]) + 0.02],
                             np.asarray(cam.get_depth(), dtype=float))
             name = f"{li:02d}_{kind}_{int(dist)}m.png"
             im.save(out / name)
