@@ -235,9 +235,107 @@ def build_magna_shell(stage, x_rear, x_front, roof, bed, mast_top, look) -> dict
     return {"lo": np.array([x_rear, -b_low, z0]), "hi": np.array([x_front, b_low, roof])}
 
 
-def build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_parts, centre, to_robot,
-                left_name, right_name, rear_name, wheel_I, tyre_look, prismatic=None) -> None:
+class RobotBuilder:
+    """Writes the robot's USD prims: rigid links, meshes, wheel colliders and joints."""
+
+    def __init__(self, stage, to_robot, radius):
+        self.stage, self.to_robot, self.radius = stage, to_robot, radius
+        self.rubber = None      # tyre physics material (set in main)
+        self.tyre_look = None   # tyre colour (set in main)
+
+    def look(self, name, rgb, rough):
+        """A coloured material."""
+        mat = UsdShade.Material.Define(self.stage, f"/robot/Looks/{name}")
+        sh = UsdShade.Shader.Define(self.stage, f"/robot/Looks/{name}/Shader")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(rough)
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+        return mat
+
+    def link(self, path, pos, mass, inertia=None):
+        """A rigid body at ``pos`` with mass (and optionally inertia)."""
+        x = UsdGeom.Xform.Define(self.stage, path)
+        x.AddTranslateOp().Set(Gf.Vec3d(*map(float, pos)))
+        UsdPhysics.RigidBodyAPI.Apply(x.GetPrim())
+        m = UsdPhysics.MassAPI.Apply(x.GetPrim())
+        m.CreateMassAttr(mass)
+        if inertia is not None:
+            m.CreateDiagonalInertiaAttr(Gf.Vec3f(*inertia))
+        return x
+
+    def visual(self, path, part, origin, mat):
+        """A mesh from the FBX, moved into the robot frame relative to ``origin``."""
+        m = UsdGeom.Mesh.Define(self.stage, path)
+        m.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, p)) for p in self.to_robot(part["points"]) - origin]))
+        m.CreateFaceVertexCountsAttr(part["counts"])
+        m.CreateFaceVertexIndicesAttr(part["indices"])
+        m.CreateSubdivisionSchemeAttr("none")
+        UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(mat)
+
+    def wheel_collider(self, path, mat_bind=True):
+        """A sphere collider: spheres roll smoothly and touch the road at one point."""
+        s = UsdGeom.Sphere.Define(self.stage, path)
+        s.CreateRadiusAttr(self.radius)
+        s.CreatePurposeAttr(UsdGeom.Tokens.guide)
+        UsdPhysics.CollisionAPI.Apply(s.GetPrim())
+        if mat_bind:
+            UsdShade.MaterialBindingAPI.Apply(s.GetPrim()).Bind(self.rubber, UsdShade.Tokens.weakerThanDescendants, "physics")
+
+    def revolute(self, path, b0, b1, pos0, axis, drive: bool, servo: bool = False, limit_deg: float | None = None):
+        """A hinge joint; ``servo`` = position-controlled steering motor, ``drive`` = wheel motor."""
+        j = UsdPhysics.RevoluteJoint.Define(self.stage, path)
+        j.CreateBody0Rel().SetTargets([b0])
+        j.CreateBody1Rel().SetTargets([b1])
+        j.CreateAxisAttr(axis)
+        j.CreateLocalPos0Attr(Gf.Vec3f(*map(float, pos0)))
+        j.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
+        j.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
+        j.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
+        if limit_deg is not None:
+            j.CreateLowerLimitAttr(-limit_deg)
+            j.CreateUpperLimitAttr(limit_deg)
+        if servo:
+            d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "angular")
+            d.CreateTypeAttr("force")
+            d.CreateStiffnessAttr(args.steer_stiffness * math.pi / 180.0)
+            d.CreateDampingAttr(args.steer_damping * math.pi / 180.0)
+            d.CreateMaxForceAttr(args.steer_torque)
+            d.CreateTargetPositionAttr(0.0)
+        if drive:
+            d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "angular")
+            d.CreateTypeAttr("force")
+            d.CreateStiffnessAttr(0.0)
+            d.CreateDampingAttr(args.drive_damping * math.pi / 180.0)  # USD angular drives are per degree
+            d.CreateMaxForceAttr(args.max_torque)
+            d.CreateTargetVelocityAttr(0.0)
+        return j
+
+    def prismatic(self, path, b0, b1, pos0, k, c, preload):
+        """Vertical strut: + = wheel moves up (bump). The drive's target is the free length, so the
+        spring carries ``preload`` at zero travel (design ride height)."""
+        j = UsdPhysics.PrismaticJoint.Define(self.stage, path)
+        j.CreateBody0Rel().SetTargets([b0])
+        j.CreateBody1Rel().SetTargets([b1])
+        j.CreateAxisAttr("Z")
+        j.CreateLocalPos0Attr(Gf.Vec3f(*map(float, pos0)))
+        j.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
+        j.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
+        j.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
+        j.CreateLowerLimitAttr(-args.travel)
+        j.CreateUpperLimitAttr(args.travel)
+        d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "linear")
+        d.CreateTypeAttr("force")
+        d.CreateStiffnessAttr(k)
+        d.CreateDampingAttr(c)
+        d.CreateMaxForceAttr(1e6)
+        d.CreateTargetPositionAttr(-preload / k)
+        return j
+
+
+def build_trike(builder, chassis, wheel_parts, centre, left_name, right_name, rear_name, wheel_I) -> None:
     """Front: steering knuckle (servo about z) + free wheel; rear: driven wheel on a fixed axle."""
+    to_robot = builder.to_robot
     Iw = (wheel_I[1], wheel_I[0], wheel_I[1])
     filtered = []
     susp = suspension_rates(chassis, to_robot(centre[left_name])[0], to_robot(centre[right_name])[0]) if args.suspension else None
@@ -246,33 +344,59 @@ def build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_pa
         """Chassis-side attachment of a wheel assembly: the chassis itself, or a sprung strut."""
         if susp is None:
             return "/robot/chassis", c
-        strut = link(f"/robot/{name}_strut", c, args.strut_mass, (0.01, 0.01, 0.01))
-        prismatic(f"/robot/joints/{name}_susp_joint", "/robot/chassis", strut.GetPath(), c, *susp[end])
+        strut = builder.link(f"/robot/{name}_strut", c, args.strut_mass, (0.01, 0.01, 0.01))
+        builder.prismatic(f"/robot/joints/{name}_susp_joint", "/robot/chassis", strut.GetPath(), c, *susp[end])
         filtered.append(str(strut.GetPath()))
         return strut.GetPath(), (0, 0, 0)
 
     for side, bone in (("front_left", left_name), ("front_right", right_name)):
         c = to_robot(centre[bone])[0]
         parent, at = mount(side, c, "front")
-        knuckle = link(f"/robot/{side}_knuckle", c, 2.0, (0.02, 0.02, 0.02))
-        revolute(f"/robot/joints/{side}_steer_joint", parent, knuckle.GetPath(), at, "Z",
-                 drive=False, servo=True, limit_deg=args.max_steer)
-        w = link(f"/robot/{side}_wheel", c, args.wheel_mass, Iw)
-        visual(f"/robot/{side}_wheel/visual", wheel_parts[bone], c, tyre_look)
-        wheel_collider(f"/robot/{side}_wheel/collision")
-        revolute(f"/robot/joints/{side}_wheel_joint", knuckle.GetPath(), w.GetPath(), (0, 0, 0), "Y", drive=False)
+        knuckle = builder.link(f"/robot/{side}_knuckle", c, 2.0, (0.02, 0.02, 0.02))
+        builder.revolute(f"/robot/joints/{side}_steer_joint", parent, knuckle.GetPath(), at, "Z",
+                         drive=False, servo=True, limit_deg=args.max_steer)
+        w = builder.link(f"/robot/{side}_wheel", c, args.wheel_mass, Iw)
+        builder.visual(f"/robot/{side}_wheel/visual", wheel_parts[bone], c, builder.tyre_look)
+        builder.wheel_collider(f"/robot/{side}_wheel/collision")
+        builder.revolute(f"/robot/joints/{side}_wheel_joint", knuckle.GetPath(), w.GetPath(), (0, 0, 0), "Y", drive=False)
         filtered += [str(knuckle.GetPath()), str(w.GetPath())]
     c = to_robot(centre[rear_name])[0]
-    w = link("/robot/rear_wheel", c, args.wheel_mass, Iw)
-    visual("/robot/rear_wheel/visual", wheel_parts[rear_name], c, tyre_look)
-    wheel_collider("/robot/rear_wheel/collision")
+    w = builder.link("/robot/rear_wheel", c, args.wheel_mass, Iw)
+    builder.visual("/robot/rear_wheel/visual", wheel_parts[rear_name], c, builder.tyre_look)
+    builder.wheel_collider("/robot/rear_wheel/collision")
     parent, at = mount("rear", c, "rear")
-    revolute("/robot/joints/rear_wheel_joint", parent, w.GetPath(), at, "Y", drive=True)
+    builder.revolute("/robot/joints/rear_wheel_joint", parent, w.GetPath(), at, "Y", drive=True)
     filtered.append(str(w.GetPath()))
     UsdPhysics.FilteredPairsAPI.Apply(chassis.GetPrim()).CreateFilteredPairsRel().SetTargets(filtered)
     if susp is not None:
-        stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:arb_rate", susp["arb_rate"])
-        stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:suspension", susp["report"])
+        builder.stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:arb_rate", susp["arb_rate"])
+        builder.stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:suspension", susp["report"])
+
+
+def build_diff(builder, chassis, wheel_parts, centre, left_name, right_name, caster_name, wheel_I, radius) -> None:
+    """Two driven wheels on a fixed axle and a free caster wheel at the back."""
+    to_robot = builder.to_robot
+    for side, bone in (("left", left_name), ("right", right_name)):
+        c = to_robot(centre[bone])[0]
+        w = builder.link(f"/robot/{side}_wheel", c, args.wheel_mass, (wheel_I[1], wheel_I[0], wheel_I[1]))
+        builder.visual(f"/robot/{side}_wheel/visual", wheel_parts[bone], c, builder.tyre_look)
+        builder.wheel_collider(f"/robot/{side}_wheel/collision")
+        builder.revolute(f"/robot/joints/{side}_wheel_joint", "/robot/chassis", w.GetPath(), c, "Y", drive=True)
+
+    # caster: fork swivels about z through a point ``trail`` ahead of the wheel centre
+    caster_c = to_robot(centre[caster_name])[0]
+    pivot = caster_c + np.array([args.caster_trail, 0.0, 0.0])
+    fork = builder.link("/robot/caster_fork", pivot, 0.5, (0.002, 0.002, 0.002))
+    builder.revolute("/robot/joints/caster_swivel_joint", "/robot/chassis", fork.GetPath(), pivot, "Z", drive=False)
+    cw = builder.link("/robot/caster_wheel", caster_c, args.caster_mass,
+                      (0.25 * args.caster_mass * radius**2, 0.5 * args.caster_mass * radius**2, 0.25 * args.caster_mass * radius**2))
+    builder.visual("/robot/caster_wheel/visual", wheel_parts[caster_name], caster_c, builder.tyre_look)
+    builder.wheel_collider("/robot/caster_wheel/collision", mat_bind=False)
+    builder.revolute("/robot/joints/caster_wheel_joint", fork.GetPath(), cw.GetPath(), caster_c - pivot, "Y", drive=False)
+
+    # belt and braces: the body never collides with its own wheels or caster
+    UsdPhysics.FilteredPairsAPI.Apply(chassis.GetPrim()).CreateFilteredPairsRel().SetTargets(
+        ["/robot/left_wheel", "/robot/right_wheel", "/robot/caster_fork", "/robot/caster_wheel"])
 
 
 def suspension_rates(chassis, c_left, c_right) -> dict:
@@ -353,15 +477,8 @@ def main() -> None:
     art.CreateEnabledSelfCollisionsAttr(False)  # wheel spheres overlap the body box by design
     art.CreateSolverPositionIterationCountAttr(16)
 
-    # materials: a look for the meshes and rubber for the tyres
-    def look(name, rgb, rough):
-        mat = UsdShade.Material.Define(stage, f"/robot/Looks/{name}")
-        sh = UsdShade.Shader.Define(stage, f"/robot/Looks/{name}/Shader")
-        sh.CreateIdAttr("UsdPreviewSurface")
-        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
-        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(rough)
-        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
-        return mat
+    builder = RobotBuilder(stage, to_robot, radius)
+    look = builder.look
 
     body_look, tyre_look = look("Body", (0.85, 0.42, 0.08), 0.5), look("Tyre", (0.012, 0.012, 0.012), 0.8)
     shell_looks = {"white": look("ShellWhite", (0.92, 0.93, 0.94), 0.35), "glass": look("LockerGlass", (0.03, 0.035, 0.04), 0.15),
@@ -375,86 +492,12 @@ def main() -> None:
     rm.CreateRestitutionAttr(0.0)
     pm = PhysxSchema.PhysxMaterialAPI.Apply(rubber.GetPrim())
     pm.CreateFrictionCombineModeAttr("max")
-
-    def link(path, pos, mass, inertia=None):
-        x = UsdGeom.Xform.Define(stage, path)
-        x.AddTranslateOp().Set(Gf.Vec3d(*map(float, pos)))
-        UsdPhysics.RigidBodyAPI.Apply(x.GetPrim())
-        m = UsdPhysics.MassAPI.Apply(x.GetPrim())
-        m.CreateMassAttr(mass)
-        if inertia is not None:
-            m.CreateDiagonalInertiaAttr(Gf.Vec3f(*inertia))
-        return x
-
-    def visual(path, part, origin, mat):
-        m = UsdGeom.Mesh.Define(stage, path)
-        m.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, p)) for p in to_robot(part["points"]) - origin]))
-        m.CreateFaceVertexCountsAttr(part["counts"])
-        m.CreateFaceVertexIndicesAttr(part["indices"])
-        m.CreateSubdivisionSchemeAttr("none")
-        UsdShade.MaterialBindingAPI.Apply(m.GetPrim()).Bind(mat)
-
-    def wheel_collider(path, mat_bind=True):
-        s = UsdGeom.Sphere.Define(stage, path)  # spheres roll smoothly and touch the road at one point
-        s.CreateRadiusAttr(radius)
-        s.CreatePurposeAttr(UsdGeom.Tokens.guide)
-        UsdPhysics.CollisionAPI.Apply(s.GetPrim())
-        if mat_bind:
-            UsdShade.MaterialBindingAPI.Apply(s.GetPrim()).Bind(rubber, UsdShade.Tokens.weakerThanDescendants, "physics")
-
-    def revolute(path, b0, b1, pos0, axis, drive: bool, servo: bool = False, limit_deg: float | None = None):
-        j = UsdPhysics.RevoluteJoint.Define(stage, path)
-        j.CreateBody0Rel().SetTargets([b0])
-        j.CreateBody1Rel().SetTargets([b1])
-        j.CreateAxisAttr(axis)
-        j.CreateLocalPos0Attr(Gf.Vec3f(*map(float, pos0)))
-        j.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
-        j.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
-        j.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
-        if limit_deg is not None:
-            j.CreateLowerLimitAttr(-limit_deg)
-            j.CreateUpperLimitAttr(limit_deg)
-        if servo:  # position-controlled steering motor
-            d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "angular")
-            d.CreateTypeAttr("force")
-            d.CreateStiffnessAttr(args.steer_stiffness * math.pi / 180.0)
-            d.CreateDampingAttr(args.steer_damping * math.pi / 180.0)
-            d.CreateMaxForceAttr(args.steer_torque)
-            d.CreateTargetPositionAttr(0.0)
-        if drive:
-            d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "angular")
-            d.CreateTypeAttr("force")
-            d.CreateStiffnessAttr(0.0)
-            d.CreateDampingAttr(args.drive_damping * math.pi / 180.0)  # USD angular drives are per degree
-            d.CreateMaxForceAttr(args.max_torque)
-            d.CreateTargetVelocityAttr(0.0)
-        return j
-
-    def prismatic(path, b0, b1, pos0, k, c, preload):
-        """Vertical strut: + = wheel moves up (bump). The drive's target is the free length, so the
-        spring carries ``preload`` at zero travel (design ride height)."""
-        j = UsdPhysics.PrismaticJoint.Define(stage, path)
-        j.CreateBody0Rel().SetTargets([b0])
-        j.CreateBody1Rel().SetTargets([b1])
-        j.CreateAxisAttr("Z")
-        j.CreateLocalPos0Attr(Gf.Vec3f(*map(float, pos0)))
-        j.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
-        j.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
-        j.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
-        j.CreateLowerLimitAttr(-args.travel)
-        j.CreateUpperLimitAttr(args.travel)
-        d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "linear")
-        d.CreateTypeAttr("force")
-        d.CreateStiffnessAttr(k)
-        d.CreateDampingAttr(c)
-        d.CreateMaxForceAttr(1e6)
-        d.CreateTargetPositionAttr(-preload / k)
-        return j
+    builder.rubber, builder.tyre_look = rubber, tyre_look
 
     # chassis: body box collider; mass centre at the body centre, low
     bmin, bmax = to_robot(body["min"])[0], to_robot(body["max"])[0]
     lo, hi = np.minimum(bmin, bmax), np.maximum(bmin, bmax)
-    chassis = link("/robot/chassis", (0, 0, 0), args.chassis_mass)
+    chassis = builder.link("/robot/chassis", (0, 0, 0), args.chassis_mass)
     UsdPhysics.MassAPI(chassis.GetPrim()).CreateCenterOfMassAttr(
         Gf.Vec3f(float((lo[0] + hi[0]) / 2), 0.0, float(lo[2] + 0.35 * (hi[2] - lo[2]))))
     if args.shell == "magna":
@@ -465,7 +508,7 @@ def main() -> None:
         UsdPhysics.MassAPI(chassis.GetPrim()).GetCenterOfMassAttr().Set(
             Gf.Vec3f(float((lo[0] + hi[0]) / 2), 0.0, 0.55))  # batteries and drive low in the pod
     else:
-        visual("/robot/chassis/visual", body, np.zeros(3), body_look)
+        builder.visual("/robot/chassis/visual", body, np.zeros(3), body_look)
     box = UsdGeom.Cube.Define(stage, "/robot/chassis/collision")
     box.CreateSizeAttr(1.0)
     box.AddTranslateOp().Set(Gf.Vec3d(*map(float, (lo + hi) / 2)))
@@ -481,44 +524,19 @@ def main() -> None:
     # wheels spin about +y (left axis), so positive speed rolls the robot forward (+x)
     wheel_I = (0.5 * args.wheel_mass * radius**2, 0.25 * args.wheel_mass * radius**2 + args.wheel_mass * width**2 / 12)
     if args.layout == "trike":
-        build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_parts, centre, to_robot,
-                    left_name, right_name, rear_name, wheel_I, tyre_look, prismatic=prismatic)
-        meta = root.GetPrim()
-        for k, v in {"wheel_radius": radius, "wheelbase": wheelbase, "track": track}.items():
-            meta.SetCustomDataByKey(f"talk2drive:{k}", v)
-        stage.GetRootLayer().Save()
-        raw.unlink(missing_ok=True)
-        print(f"[build] wrote {out}  (radius {radius:.3f} m, wheelbase {wheelbase:.3f} m, track {track:.3f} m)")
-        app.close()
-        return
-
-    for side, bone in (("left", left_name), ("right", right_name)):
-        c = to_robot(centre[bone])[0]
-        w = link(f"/robot/{side}_wheel", c, args.wheel_mass, (wheel_I[1], wheel_I[0], wheel_I[1]))
-        visual(f"/robot/{side}_wheel/visual", wheel_parts[bone], c, tyre_look)
-        wheel_collider(f"/robot/{side}_wheel/collision")
-        revolute(f"/robot/joints/{side}_wheel_joint", "/robot/chassis", w.GetPath(), c, "Y", drive=True)
-
-    # caster: fork swivels about z through a point ``trail`` ahead of the wheel centre
-    pivot = caster_c + np.array([args.caster_trail, 0.0, 0.0])
-    fork = link("/robot/caster_fork", pivot, 0.5, (0.002, 0.002, 0.002))
-    revolute("/robot/joints/caster_swivel_joint", "/robot/chassis", fork.GetPath(), pivot, "Z", drive=False)
-    cw = link("/robot/caster_wheel", caster_c, args.caster_mass,
-              (0.25 * args.caster_mass * radius**2, 0.5 * args.caster_mass * radius**2, 0.25 * args.caster_mass * radius**2))
-    visual("/robot/caster_wheel/visual", wheel_parts[caster_name], caster_c, tyre_look)
-    wheel_collider("/robot/caster_wheel/collision", mat_bind=False)
-    revolute("/robot/joints/caster_wheel_joint", fork.GetPath(), cw.GetPath(), caster_c - pivot, "Y", drive=False)
-
-    # belt and braces: the body never collides with its own wheels or caster
-    UsdPhysics.FilteredPairsAPI.Apply(chassis.GetPrim()).CreateFilteredPairsRel().SetTargets(
-        ["/robot/left_wheel", "/robot/right_wheel", "/robot/caster_fork", "/robot/caster_wheel"])
-
-    meta = root.GetPrim()
-    for k, v in {"wheel_radius": radius, "wheel_base": track, "caster_offset": float(-caster_c[0])}.items():
-        meta.SetCustomDataByKey(f"talk2drive:{k}", v)
+        build_trike(builder, chassis, wheel_parts, centre, left_name, right_name, rear_name, wheel_I)
+        custom = {"wheel_radius": radius, "wheelbase": wheelbase, "track": track}
+    else:
+        build_diff(builder, chassis, wheel_parts, centre, left_name, right_name, caster_name, wheel_I, radius)
+        custom = {"wheel_radius": radius, "wheel_base": track, "caster_offset": float(-caster_c[0])}
+    for k, v in custom.items():
+        root.GetPrim().SetCustomDataByKey(f"talk2drive:{k}", v)
     stage.GetRootLayer().Save()
     raw.unlink(missing_ok=True)
-    print(f"[build] wrote {out}  (radius {radius:.3f} m, track {track:.3f} m)")
+    if args.layout == "trike":
+        print(f"[build] wrote {out}  (radius {radius:.3f} m, wheelbase {wheelbase:.3f} m, track {track:.3f} m)")
+    else:
+        print(f"[build] wrote {out}  (radius {radius:.3f} m, track {track:.3f} m)")
     app.close()
 
 

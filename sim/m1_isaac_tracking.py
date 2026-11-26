@@ -175,10 +175,22 @@ def main() -> None:
         bot.reset_to(start)  # same start pose for every controller, robot settled on the ground
         print(f"[m1] running {name} on {traj.name} ({traj.duration:.0f} s)...")
         frames_dir = Path(args.out) / f"frames_{args.traj}_{args.robot}_{name}"
-        hooks = [h for h in (make_drawer(traj, bot) if args.draw else None,
-                             make_follower(bot, 3.0 if bot.is_car else scale) if args.view == "follow" else None,
-                             make_recorder(frames_dir, args.record_every) if args.record else None) if h]
-        log = run_tracking(bot, ctrl, traj, on_control_step=(lambda t, s, c: [h(t, s, c) for h in hooks]) if hooks else None)
+        # things to do after every control step: draw the path, move the camera, save a frame
+        hooks = []
+        if args.draw:
+            drawer = make_drawer(traj, bot)
+            if drawer:
+                hooks.append(drawer)
+        if args.view == "follow":
+            hooks.append(make_follower(bot, 3.0 if bot.is_car else scale))
+        if args.record:
+            hooks.append(make_recorder(frames_dir, args.record_every))
+
+        def after_each_step(t, s, c):
+            for hook in hooks:
+                hook(t, s, c)
+
+        log = run_tracking(bot, ctrl, traj, on_control_step=after_each_step if hooks else None)
         save_run(log, args.out)
         logs.append(log)
         print("[m1] " + compute_metrics(log).table_row())

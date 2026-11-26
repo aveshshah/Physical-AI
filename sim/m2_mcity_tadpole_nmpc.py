@@ -87,6 +87,17 @@ from talk2drive.opendrive import RoutePath  # noqa: E402
 from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
 
 
+def count_steering_reversals(steer):
+    """How often the steering command changes direction by more than 0.02 rad (Rule 3D)."""
+    count = 0
+    for i in range(2, len(steer)):
+        before = steer[i - 1] - steer[i - 2]
+        now = steer[i] - steer[i - 1]
+        if before * now < 0 and abs(now) > 0.02:
+            count += 1
+    return count
+
+
 def score(log: dict, P, lane_width: float, lap_length: float) -> dict:
     """The CARLA project's rules, measured on this run (audit.py definitions where they exist)."""
     t = np.asarray(log["t"])
@@ -101,9 +112,7 @@ def score(log: dict, P, lane_width: float, lap_length: float) -> dict:
     ay = avg(vx * np.asarray(log["r"]))
     cte = np.abs(log["cte"])
     epsi = np.degrees(np.abs(log["epsi"]))
-    steer = np.asarray(log["delta_cmd"])
-    flips = sum(1 for i in range(2, len(steer))
-                if (steer[i - 1] - steer[i - 2]) * (steer[i] - steer[i - 1]) < 0 and abs(steer[i] - steer[i - 1]) > 0.02)
+    flips = count_steering_reversals(np.asarray(log["delta_cmd"]))
     cte_limit = 0.10 * lane_width
     moving = vx > 0.5
     crawl = (vx < 1.5) & (np.asarray(log["v_ref"]) > 2.5)  # slow while the plan wants to go (Rule 3E)
@@ -144,7 +153,9 @@ def _baseline_speed(baseline: str | None, s: np.ndarray):
 
 def speed_tracking(log: dict, P, baseline: str | None, metrics: dict) -> dict:
     """Does the NMPC still hold the target speed? Against its own reference and against an undisturbed lap."""
-    vx, vref, s = (np.asarray(log[k]) for k in ("vx", "v_ref", "s"))
+    vx = np.asarray(log["vx"])
+    vref = np.asarray(log["v_ref"])
+    s = np.asarray(log["s"])
     moving = vref > 0.5
     e = (vx - vref)[moving]
     mode = np.asarray(log["plan_mode"])
@@ -283,6 +294,46 @@ def plot(log: dict, path: RoutePath, lap_length: float, P, out: Path, metrics: d
     return p
 
 
+def make_contact_printer(bot, start, TS):
+    """Debugging (--contacts): returns a function that prints every contact that is not a tyre on the road."""
+    from omni.physx import get_physx_simulation_interface
+    from pxr import PhysxSchema, Usd, UsdPhysics
+
+    for prim in Usd.PrimRange(bot.world.stage.GetPrimAtPath("/World/Jetbot")):
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr(0.0)
+    bot.reset_to(start)
+    physx = get_physx_simulation_interface()
+
+    def print_contacts(t):
+        from pxr import PhysicsSchemaTools
+
+        headers, data = physx.get_contact_report()
+        for h in headers:
+            pair = sorted([str(PhysicsSchemaTools.intToSdfPath(h.collider0)), str(PhysicsSchemaTools.intToSdfPath(h.collider1))])
+            points = data[h.contact_data_offset:h.contact_data_offset + h.num_contact_data]
+            impulse = sum(float(np.linalg.norm(np.asarray(c.impulse))) for c in points)
+            pos = np.asarray(points[0].position) if len(points) else np.zeros(3)
+            normal = np.asarray(points[0].normal) if len(points) else np.zeros(3)
+            gap = min((float(c.separation) for c in points), default=0.0)
+            tyre_on_road = any("wheel/collision" in q for q in pair) and any("/World/Environment" in q for q in pair)
+            if tyre_on_road and impulse < 400.0 * TS and abs(normal[2]) > 0.9:
+                continue   # ordinary tyre support: under ~400 N, normal near vertical
+            print(f"[contact] t={t:6.2f} {pair[0].replace('/World/','')} <-> {pair[1].replace('/World/','')} "
+                  f"n={len(points)} impulse={impulse:7.2f} N s sep={gap*100:+.1f} cm "
+                  f"normal=({normal[0]:+.2f},{normal[1]:+.2f},{normal[2]:+.2f}) at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+
+    return print_contacts
+
+
+def road_mu_at(s, patches, default_mu):
+    """Road friction at distance s: the patch's value if s is inside a low-friction patch."""
+    for start, end, mu in patches:
+        if start <= s <= end:
+            return mu
+    return default_mu
+
+
 def main() -> None:
     out = (REPO / args.out) if not os.path.isabs(args.out) else Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -307,58 +358,28 @@ def main() -> None:
           + (f"; patches {[(round(a), round(b), m) for a, b, m in patches]}" if patches else ""))
     bot.reset_to((x0, y0, psi0))  # the world reset re-parses physics, picking up the road materials
     bot.params.max_steer = float(np.deg2rad(P.MAX_STEER_DEG))  # the servo may go to the physical limit
-    contact_reader = None
-    if args.contacts:
-        from omni.physx import get_physx_simulation_interface
-        from pxr import PhysxSchema, Usd, UsdPhysics
-
-        for prim in Usd.PrimRange(bot.world.stage.GetPrimAtPath("/World/Jetbot")):
-            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
-                PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr(0.0)
-        bot.reset_to((x0, y0, psi0))
-        sim_if = get_physx_simulation_interface()
-
-        def contact_reader(t):
-            from pxr import PhysicsSchemaTools
-
-            headers, data = sim_if.get_contact_report()
-            for h in headers:
-                a = str(PhysicsSchemaTools.intToSdfPath(h.collider0))
-                b = str(PhysicsSchemaTools.intToSdfPath(h.collider1))
-                pair = sorted([a, b])
-                pts = data[h.contact_data_offset:h.contact_data_offset + h.num_contact_data]
-                imp = sum(float(np.linalg.norm(np.asarray(c.impulse))) for c in pts)
-                pos = np.asarray(pts[0].position) if len(pts) else np.zeros(3)
-                nrm = np.asarray(pts[0].normal) if len(pts) else np.zeros(3)
-                sep = min((float(c.separation) for c in pts), default=0.0)
-                tyre_road = any("wheel/collision" in q for q in pair) and any("/World/Environment" in q for q in pair)
-                if tyre_road and imp < 400.0 * TS and abs(nrm[2]) > 0.9:
-                    continue  # ordinary tyre support: under ~400 N, normal near vertical
-                print(f"[contact] t={t:6.2f} {pair[0].replace('/World/','')} <-> {pair[1].replace('/World/','')} "
-                      f"n={len(pts)} impulse={imp:7.2f} N s sep={sep*100:+.1f} cm normal=({nrm[0]:+.2f},{nrm[1]:+.2f},{nrm[2]:+.2f}) "
-                      f"at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+    contact_printer = make_contact_printer(bot, (x0, y0, psi0), TS) if args.contacts else None
     recorder = ViewportRecorder(out / "frames", args.record_every) if args.record else None
 
     keys = ("t", "x", "y", "psi", "vx", "vy", "r", "delta", "delta_cmd", "fx_drive", "fx_brake", "s", "cte", "epsi",
             "v_ref", "status", "solve_ms", "dF", "roll", "pitch", "z",
             "dF_true", "grade_extra", "wind_x", "wind_y", "f_aero_y", "plan_mode", "wheel_rear", "mu_road",
             "susp_fl", "susp_fr", "susp_r")
-    patch_s = [(a, b, m) for a, b, m in patches]
     log = {k: [] for k in keys}
     driver = TadpoleDriver(stack, bot, loads, body_forces, grade_governor=not args.no_grade_governor)
     driver.set_path(path, s_hint=args.start_s)
     s_stop = lap_length
     wall0 = time.perf_counter()
-    k = 0
-    while k * TS < args.max_time and app.is_running():
-        t = k * TS
+    step = 0
+    while step * TS < args.max_time and app.is_running():
+        t = step * TS
         row = driver.tick(t, s_stop)
-        s0, vx, cte, roll = row["s"], row["vx"], row["cte"], row["roll"]
-        row["mu_road"] = next((m for a, b, m in patch_s if a <= s0 <= b), scenario.mu)
+        s, vx, cte, roll = row["s"], row["vx"], row["cte"], row["roll"]
+        row["mu_road"] = road_mu_at(s, patches, scenario.mu)
         for key in keys:
             log[key].append(row[key])
-        if k % 50 == 0:
-            print(f"[m2] t={t:6.1f}s s={s0:7.1f}/{lap_length:.0f} m v={vx:5.2f} (ref {row['v_ref']:5.2f}) m/s "
+        if step % 50 == 0:
+            print(f"[m2] t={t:6.1f}s s={s:7.1f}/{lap_length:.0f} m v={vx:5.2f} (ref {row['v_ref']:5.2f}) m/s "
                   f"cte={cte * 100:+6.1f} cm epsi={math.degrees(row['epsi']):+5.1f} deg "
                   f"steer={math.degrees(row['delta_cmd']):+6.1f} deg Fx={row['fx_drive'] - row['fx_brake']:+6.0f} N "
                   f"solve={row['solve_ms']:4.1f} ms status={row['status']}")
@@ -368,20 +389,20 @@ def main() -> None:
         if recorder is not None:
             recorder.capture(t)
         driver.step(render=not args.headless or args.record)
-        if contact_reader is not None:
-            contact_reader(t)
-        k += 1
-        if s0 >= s_stop - 1.0 and vx < 0.05:
+        if contact_printer is not None:
+            contact_printer(t)
+        step += 1
+        if s >= s_stop - 1.0 and vx < 0.05:
             break
         if abs(roll) > math.radians(45) or abs(cte) > 3.0:
-            print(f"[m2] FAILED at t={t:.1f} s, s={s0:.0f} m: roll {math.degrees(roll):.0f} deg, cte {cte:.2f} m")
+            print(f"[m2] FAILED at t={t:.1f} s, s={s:.0f} m: roll {math.degrees(roll):.0f} deg, cte {cte:.2f} m")
             break
 
     wall = time.perf_counter() - wall0
     metrics = score(log, P, lane_width, lap_length)
     metrics["disturbance"] = {"name": scenario.name, "description": scenario.describe(), "patches": patches}
     metrics["speed_tracking"] = speed_tracking(log, P, args.baseline, metrics)
-    metrics["sim_time_s"] = k * TS
+    metrics["sim_time_s"] = step * TS
     metrics["wall_time_s"] = wall
     metrics["route_roads"] = [f"{r}{'+' if d > 0 else '-'}" for r, d in route]
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -389,7 +410,7 @@ def main() -> None:
     fig = plot(log, path, lap_length, P, out, metrics)
     plot_disturbance(log, P, out, metrics, args.baseline)
     print("[m2] " + json.dumps({k_: v for k_, v in metrics.items() if k_ != "route_roads"}, indent=1))
-    print(f"[m2] plot {fig}  ({k * TS:.0f} s simulated in {wall:.0f} s)")
+    print(f"[m2] plot {fig}  ({step * TS:.0f} s simulated in {wall:.0f} s)")
     if recorder is not None and recorder.save_gif(app, out / "lap.gif", round(1000 * args.record_every / 4)):
         print(f"[m2] recording {out / 'lap.gif'} (4x real time)")
     app.close()

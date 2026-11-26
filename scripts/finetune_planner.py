@@ -157,92 +157,120 @@ def iou(a, b) -> float:
     return inter / ua if ua > 0 else 0.0
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default="runs/planner_data")
-    ap.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
-    ap.add_argument("--out", default="runs/planner_lora")
-    ap.add_argument("--epochs", type=float, default=1.0)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--accum", type=int, default=8)
-    ap.add_argument("--eval-n", type=int, default=200, help="validation samples scored by generation after training")
-    ap.add_argument("--eval-only", action="store_true")
-    ap.add_argument("--adapter", default=None)
-    ap.add_argument("--testset", default="runs/planner_testset", help="hand-made 36-image set (labels.json) also scored")
-    args = ap.parse_args()
+def shuffled_order(n_records: int, steps: int) -> list[int]:
+    """Which record to train on at each step: the data in a new random order every epoch."""
+    rng = random.Random(0)
+    order = []
+    while len(order) < steps:
+        idx = list(range(n_records))
+        rng.shuffle(idx)
+        order += idx
+    return order[:steps]
 
+
+def weighted_loss(model, processor, enc):
+    """Cross-entropy on the answer tokens, with the decision tokens (action, offset) counted DECISION_WEIGHT times."""
+    import torch
+
+    n_prompt = enc.pop("n_prompt")
+    enc = enc.to(model.device)
+    labels = enc.pop("labels")
+    weights = 1.0 + (DECISION_WEIGHT - 1.0) * decision_mask(processor, labels.clamp(min=0), n_prompt).to(model.device)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        logits = model(**enc).logits[:, :-1].float()   # the prediction for each next token
+    target = labels[:, 1:]
+    ce = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1),
+                                           ignore_index=-100, reduction="none").view_as(target)
+    w = weights[:, 1:] * (target != -100)
+    return (ce * w).sum() / w.sum()
+
+
+def train(model, processor, records, root, args):
+    """LoRA training: one image at a time, a weight update every --accum images, warm-up then cosine learning rate."""
     import torch
     from PIL import Image
 
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+    steps = int(len(records) * args.epochs)
+    n_updates = math.ceil(steps / args.accum)
+    warmup = max(1, n_updates // 20)
+
+    def lr_factor(update):
+        ramp_up = min(1.0, (update + 1) / warmup)
+        return ramp_up * 0.5 * (1 + math.cos(math.pi * min(1.0, update / max(1, n_updates))))   # then cosine down to 0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    model.train()
+    start, losses = time.time(), []
+    for k, i in enumerate(shuffled_order(len(records), steps)):
+        record = records[i]
+        image = Image.open(root / record["image"]).convert("RGB")
+        enc = encode(processor, image, answer_text(record["target"]))
+        loss = weighted_loss(model, processor, enc) / args.accum
+        loss.backward()
+        losses.append(loss.item() * args.accum)
+
+        if (k + 1) % args.accum == 0 or k == steps - 1:   # update the weights every --accum images
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        if (k + 1) % 100 == 0:
+            elapsed = time.time() - start
+            per_sample = elapsed / (k + 1)
+            print(f"[ft] {k + 1}/{steps}  loss {sum(losses[-100:]) / len(losses[-100:]):.4f}  "
+                  f"lr {scheduler.get_last_lr()[0]:.2e}  {per_sample:.2f} s/sample, ~{(steps - k - 1) * per_sample / 60:.0f} min left",
+                  flush=True)
+    return steps, (time.time() - start) / 60
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--data", default="runs/planner_data")
+    parser.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
+    parser.add_argument("--out", default="runs/planner_lora")
+    parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--accum", type=int, default=8, help="images per weight update")
+    parser.add_argument("--eval-n", type=int, default=200, help="validation samples scored by generation after training")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--adapter", default=None)
+    parser.add_argument("--testset", default="runs/planner_testset", help="hand-made 36-image set (labels.json) also scored")
+    args = parser.parse_args()
+
     root = REPO / args.data
     out = REPO / args.out
-    train = load_records(root / "train.jsonl")
-    val = load_records(root / "val.jsonl")
-    print(f"[ft] {len(train)} train, {len(val)} val samples", flush=True)
+    train_records = load_records(root / "train.jsonl")
+    val_records = load_records(root / "val.jsonl")
+    print(f"[ft] {len(train_records)} train, {len(val_records)} val samples", flush=True)
 
     if args.eval_only:
         model, processor = load_model(args.model, args.adapter, train=False)
     else:
         model, processor = load_model(args.model, None, train=True)
-        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.0)
-        steps = int(len(train) * args.epochs)
-        n_opt = math.ceil(steps / args.accum)
-        warm = max(1, n_opt // 20)
-        sched = torch.optim.lr_scheduler.LambdaLR(
-            opt, lambda k: min(1.0, (k + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, k / max(1, n_opt)))))
-        model.train()
-        rng = random.Random(0)
-        order = []
-        while len(order) < steps:
-            idx = list(range(len(train)))
-            rng.shuffle(idx)
-            order += idx
-        order = order[:steps]
-        t0, run_loss = time.time(), []
-        for k, i in enumerate(order):
-            r = train[i]
-            img = Image.open(root / r["image"]).convert("RGB")
-            enc = encode(processor, img, answer_text(r["target"]))
-            n_prompt = enc.pop("n_prompt")
-            enc = enc.to(model.device)
-            labels = enc.pop("labels")
-            wts = 1.0 + (DECISION_WEIGHT - 1.0) * decision_mask(processor, labels.clamp(min=0), n_prompt).to(model.device)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(**enc).logits[:, :-1].float()
-            tgt = labels[:, 1:]
-            ce = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1),
-                                                   ignore_index=-100, reduction="none").view_as(tgt)
-            w = wts[:, 1:] * (tgt != -100)
-            loss = (ce * w).sum() / w.sum() / args.accum
-            loss.backward()
-            run_loss.append(loss.item() * args.accum)
-            if (k + 1) % args.accum == 0 or k == steps - 1:
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-                opt.step()
-                sched.step()
-                opt.zero_grad(set_to_none=True)
-            if (k + 1) % 100 == 0:
-                el = time.time() - t0
-                print(f"[ft] {k + 1}/{steps}  loss {sum(run_loss[-100:]) / len(run_loss[-100:]):.4f}  "
-                      f"lr {sched.get_last_lr()[0]:.2e}  {el / (k + 1):.2f} s/sample, ~{(steps - k - 1) * el / (k + 1) / 60:.0f} min left",
-                      flush=True)
+        steps, minutes = train(model, processor, train_records, root, args)
         out.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(out)
-        (out / "train_info.json").write_text(json.dumps({"model": args.model, "samples": steps, "epochs": args.epochs,
-                                                          "lr": args.lr, "accum": args.accum, "prompt": FT_PROMPT,
-                                                          "minutes": (time.time() - t0) / 60}, indent=1))
+        info = {"model": args.model, "samples": steps, "epochs": args.epochs, "lr": args.lr, "accum": args.accum,
+                "prompt": FT_PROMPT, "minutes": minutes}
+        (out / "train_info.json").write_text(json.dumps(info, indent=1))
         print(f"[ft] adapter saved to {out}", flush=True)
         model.eval()
 
-    res = {"val": evaluate(model, processor, val, root, args.eval_n)}
-    ts = REPO / args.testset / "labels.json"
-    if ts.exists():
-        res["testset"] = evaluate(model, processor, json.loads(ts.read_text()), REPO / args.testset)
-    tag = "lora" if (args.adapter or not args.eval_only) else "base"
-    dest = (out if not args.eval_only or args.adapter else REPO / "runs") / f"eval_{tag}.json"
-    dest.write_text(json.dumps(res, indent=1))
-    for k, v in res.items():
-        print(f"[ft] {k}: " + json.dumps({kk: vv for kk, vv in v.items() if kk != "rows"}), flush=True)
+    # score: validation images, and the hand-made test set if it exists
+    results = {"val": evaluate(model, processor, val_records, root, args.eval_n)}
+    testset = REPO / args.testset / "labels.json"
+    if testset.exists():
+        results["testset"] = evaluate(model, processor, json.loads(testset.read_text()), REPO / args.testset)
+    if args.eval_only and not args.adapter:
+        dest = REPO / "runs" / "eval_base.json"   # the base model without fine-tuning
+    else:
+        dest = out / "eval_lora.json"
+    dest.write_text(json.dumps(results, indent=1))
+    for name, r in results.items():
+        print(f"[ft] {name}: " + json.dumps({k: v for k, v in r.items() if k != "rows"}), flush=True)
 
 
 if __name__ == "__main__":
