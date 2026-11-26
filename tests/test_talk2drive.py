@@ -178,3 +178,88 @@ def test_grade_wind_and_drag_signs():
     assert max(abs(g.grade(s)) for s in range(0, 1000, 2)) == pytest.approx(0.06, rel=0.02)
     drag = RoadLoadModel(parse_scenario("drag"), _P, 1000.0)
     assert drag.forces(0.0, 10.0, 0.0, 0.0)["dF_true"] < 0
+
+
+# ---------------------------------------------------------------- talk to drive
+def test_parse_command():
+    from talk2drive.commands import parse_command
+
+    cases = {
+        "turn left": ("turn", "left"), "take the next right please": ("turn", "right"), "go straight": ("turn", "straight"),
+        "EMERGENCY STOP": ("emergency", None), "brake hard!": ("emergency", None), "pull over": ("pull_over", None),
+        "park on the side": ("pull_over", None), "accelerate more": ("accelerate", None), "speed up": ("accelerate", None),
+        "brake more": ("brake", None), "slow down": ("brake", None), "hold speed": ("hold", None),
+        "set speed to 6": ("set_speed", 6.0), "drive at 36 km/h": ("set_speed", 10.0), "stop": ("stop", None),
+        "go": ("go", None), "keep going": ("go", None), "what's ahead?": ("ahead", None), "status": ("status", None),
+        "sing a song": ("unknown", None), "u-turn": ("u_turn", None), "turn around": ("u_turn", None),
+        "change lane left": ("lane", "left"), "switch to the right lane": ("lane", "right"), "overtake": ("lane", None),
+        "steer left": ("nudge", "left"), "move a bit to the right": ("nudge", "right"), "keep left": ("nudge", "left"),
+        "back to the middle": ("centre", None), "take left": ("turn", "left"),
+    }
+    for text, (kind, value) in cases.items():
+        c = parse_command(text)
+        assert (c.kind, c.value) == (kind, value), text
+
+
+def test_speed_commander_steps():
+    from talk2drive.commands import SpeedCommander
+
+    sc = SpeedCommander(v_max=15.0)
+    sc.go(0.0)
+    assert sc.rate == 1.0 and sc.goal == 8.0
+    for _ in range(1000):
+        sc.update(0.02)
+    assert sc.v_set == 8.0 and sc.rate == 0.0
+    sc.accelerate(8.0)
+    sc.accelerate(8.0)
+    sc.accelerate(8.0)
+    assert sc.rate == 1.5              # three steps of 0.5 m/s^2
+    for _ in range(5):
+        sc.accelerate(8.0)
+    assert sc.rate == sc.MAX_ACCEL     # capped
+    sc.brake(9.0)
+    assert sc.rate == -0.5 and sc.v_set == 9.0   # braking starts from the actual speed
+    sc.brake(9.0)
+    assert sc.rate == -1.0
+    sc.hold(8.5)
+    assert sc.rate == 0.0 and sc.v_set == 8.5
+
+
+def test_road_router_turns():
+    import os
+
+    import pytest
+
+    from talk2drive.mcity import MCITY_XODR, mcity_to_sim
+    from talk2drive.opendrive import OpenDrive
+    from talk2drive.road_router import RoadRouter
+
+    if not os.path.exists(MCITY_XODR):
+        pytest.skip("Mcity map not installed")
+    router = RoadRouter(OpenDrive(MCITY_XODR), mcity_to_sim)
+    route = router.build(router.keep_going([("104", 1)], 700))
+    assert route.path.length > 600
+    # from the start the first junction is 225 m away: nothing within 200 m
+    assert router.plan_turn(route, 0.0, "left", 20.0) == (None, None, None)
+    # from 300 m: left at the fork 35 m ahead, right at the junction 124 m ahead
+    roads, junction, move = router.plan_turn(route, 300.0, "left", 20.0)
+    assert move.kind == "left" and 30 < junction.s - 300 < 40
+    roads, junction, move = router.plan_turn(route, 300.0, "right", 20.0)
+    assert move.kind == "right" and 115 < junction.s - 300 < 130
+    new = router.build(roads)
+    assert new.roads[0] == route.roads[route.road_index_at(300.0)]
+
+
+def test_router_skips_broken_links_and_turns_back():
+    from talk2drive.mcity import MCITY_XODR, mcity_to_sim
+    from talk2drive.opendrive import OpenDrive
+    from talk2drive.road_router import RoadRouter
+
+    router = RoadRouter(OpenDrive(MCITY_XODR), mcity_to_sim)
+    assert ("107", -1) in router.od.successors("100", -1)       # linked in the map ...
+    assert ("107", -1) not in router.next_roads(("100", -1))    # ... but its lanes start 45 m away
+    route = router.build(router.keep_going([("104", 1)], 600))
+    lanes = router.lanes_beside(route.roads[0], *route.path.xy[40], route.path.heading(10.0))
+    assert sorted(rank for rank, _, _ in lanes) == [-1, 0, 1]   # two lanes my way, one the other way
+    back = router.route_back(route, 290.0)                     # on a one-way road: round the block
+    assert back is not None and back[0] == route.roads[route.road_index_at(290.0)]

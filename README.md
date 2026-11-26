@@ -309,6 +309,37 @@ OMNI_KIT_ACCEPT_EULA=YES DISPLAY=:1 ~/isaac-env/bin/python sim/m3_vlm_planner.py
 
 `runs/` is not committed: rebuild the data and the adapter with the scripts above.
 
+### Talk to drive (M4)
+
+`sim/m4_talk_to_drive.py` drives the robot round Mcity on spoken or typed commands. The robot plans
+the global route on the OpenDRIVE road graph and the CARLA NMPC tracks it.
+
+| Say | What happens |
+|---|---|
+| go / stop / emergency stop | drive at 8 m/s, normal stop in the lane, full emergency brake |
+| accelerate / brake (more) | speed up or slow down, 0.5 m/s² harder with each command |
+| hold speed / set speed 20 km/h | keep the speed, or go to a given speed |
+| turn left / right / go straight | at the first junction within 200 m that allows it (or "no left turn possible") |
+| u-turn / turn around | turns where it is, also from a stop or a parking spot; on one-way or narrow roads it goes round a roundabout or block |
+| change lane left / right | into the next lane going the same way (never into oncoming traffic) |
+| steer left / right | 0.5 m to the side inside the lane, back to the centre before the next junction |
+| pull over | parks at the right-hand edge, away from junctions |
+| what's ahead / status / help / reset | junctions coming up, speed and mode, the list of commands, back on the wheels after tipping |
+
+A move asked for while stopped also starts the robot. Phrases the keyword parser doesn't know
+("let me out here", "give the cyclist more room") go to the local Qwen3-VL-4B model, which picks
+one of the commands above or explains why it can't.
+
+```bash
+.venv/bin/python scripts/vlm_ground_server.py --config configs/sim_4b.yaml --adapter runs/planner_lora   # for unknown phrases
+OMNI_KIT_ACCEPT_EULA=YES DISPLAY=:1 ~/isaac-env/bin/python sim/m4_talk_to_drive.py
+.venv/bin/python scripts/voice.py          # push-to-talk (Enter), spoken replies; or:
+.venv/bin/python scripts/say.py "turn left"
+```
+
+Voice runs offline: Whisper small.en for speech recognition and Piper for the replies (`pip install -e .[voice]`).
+Speak over the robot to interrupt it.
+
 ## Layout
 
 ```
@@ -324,5 +355,5 @@ configs/             default / low_vram / edge_llamacpp
 scripts/             check_env.py, tiny_qwen3vl_smoke.py
 docs/ROADMAP.md      memory → planning → actions (NMPC) → robot
 src/talk2drive/      Isaac robot wrapper, Mcity route, tadpole NMPC driver, disturbances, VLM planner
-sim/                 Isaac Sim scripts (M1–M3, data generation, suspension check, sweeps)
+sim/                 Isaac Sim scripts (M1–M4, data generation, suspension check, sweeps)
 ```

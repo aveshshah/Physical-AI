@@ -14,6 +14,14 @@ MCITY_XODR = os.path.expanduser(
     "~/assets/mcity-digital-twin/Omniverse/Collected_McityMap_NSR_v4_1_6/mcity_map_v6_nvidia.xodr")
 
 
+def mcity_to_sim(points: np.ndarray) -> np.ndarray:
+    """OpenDRIVE map coordinates (n, 2) -> Isaac scene coordinates (the Mcity scene is shifted and rotated)."""
+    env = LOCAL_ENVIRONMENTS["mcity"]
+    c, s = math.cos(math.radians(env.yaw_deg)), math.sin(math.radians(env.yaw_deg))
+    q = np.asarray(points, dtype=float) - np.asarray(env.origin[:2])
+    return np.c_[c * q[:, 0] - s * q[:, 1], s * q[:, 0] + c * q[:, 1]]
+
+
 def mcity_lap(xodr: str, start: str, seed: int) -> tuple[RoutePath, list, list]:
     """A lane-following loop as a closed path in the Isaac scene frame, its lane widths and its roads."""
     od = OpenDrive(xodr)

@@ -273,16 +273,23 @@ class OpenDrive:
         side = -1 if direction > 0 else 1
         return max(sum(1 for i, ln in lanes.items() if i * side > 0 and ln.type == "driving") for _, lanes in road.sections)
 
-    def route_points(self, route: list[tuple[str, int]], step: float = 0.25) -> tuple[np.ndarray, list[float]]:
-        """Lane-centre polyline (n, 2) for a road-level route and the lane widths met along it.
+    def route_points(self, route: list[tuple[str, int]], step: float = 0.25, with_starts: bool = False,
+                     force: dict | None = None):
+        """Lane-centre polyline (n, 2) for a road-level route and the lane widths met along it
+        (and, with ``with_starts``, the index of each road's first point in the polyline).
+        ``force`` {route index: lane rank} keeps those roads in that lane all along (a lane change).
 
         Junction connectors join specific lanes (a right turn leaves from the outer lane), so the
         lane on each road is chosen by dynamic programming to minimise the jumps at every join."""
         lane_change_cost = 1.0  # m-equivalent: prefer staying in lane when joins allow it
         cands = []
-        for r, d in route:
+        force = force or {}
+        for k, (r, d) in enumerate(route):
             n = max(1, self.lane_count(r, d))
             opts = [(i, o) for i in range(n) for o in range(n)] if self.roads[r].length > 15.0 else [(i, i) for i in range(n)]
+            if k in force:
+                rank = min(force[k], n - 1)
+                opts = [(rank, rank)]
             cands.append([(self._lane_points(r, d, i, step, o), float(i != o) * lane_change_cost) for i, o in opts])
         cost = [np.array([pen for _, pen in cands[0]])]
         back = []
@@ -303,14 +310,18 @@ class OpenDrive:
             choice.append(k)
         choice.reverse()
         cands = [[pts for pts, _ in cand] for cand in cands]
-        pts, widths = [], []
+        pts, widths, starts = [], [], []
         for cand, k in zip(cands, choice):
             P, w = cand[k]
+            starts.append(len(pts))
             pts.extend(P.tolist())
             widths.extend(w)
         P = np.asarray(pts, dtype=float)
         keep = np.r_[True, np.hypot(*np.diff(P, axis=0).T) > 1e-3]
-        return P[keep], widths
+        if not with_starts:
+            return P[keep], widths
+        kept_index = np.cumsum(keep) - 1  # raw point index -> index after dropping duplicates
+        return P[keep], widths, [int(kept_index[min(i, len(keep) - 1)]) for i in starts]
 
 
 # --------------------------------------------------------------------------- path for the NMPC

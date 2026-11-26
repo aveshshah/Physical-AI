@@ -119,8 +119,17 @@ class TadpoleDriver:
         return dict(pos=pos, Rb=Rb, cg=cg, X=float(pos[0]), Y=float(pos[1]), psi=psi, delta=delta,
                     vx=vx, vy=vy, r=r, ax=ax, roll=roll, pitch=pitch)
 
-    def tick(self, t: float, s_stop: float, v_cap: float | None = None, stop_lag: float = 0.0) -> dict:
+    def tick(self, t: float, s_stop: float, v_cap: float | None = None, stop_lag: float = 0.0,
+             emergency: bool = False, hold_brake: float = 0.0, hard_brake_to: float | None = None) -> dict:
         """One control cycle along ``self.path``, stopping at ``s_stop``. Returns the log row.
+
+        ``emergency``: stop as hard as the vehicle can, the way the CARLA project's emergency braking
+        does it (ACC_EMERGENCY_DECEL_V1 / EMERGENCY_BRAKE_MAP_V1 in run_nmpc_carla.py): a plan to
+        zero speed at AX_EMERGENCY_DECEL with no jerk limit, no drive force, and the brake force
+        raised to FX_EMERGENCY_BRAKE_MAX after the NMPC and inner loop.
+        ``hold_brake`` [N]: at least this much brake force and no drive (holding the robot still).
+        ``hard_brake_to`` [m/s]: get down to this speed as fast as the emergency brake allows (a turn
+        commanded too late for normal braking), then drive on normally.
 
         ``stop_lag`` [s]: the planner reaches a falling cap with a jerk-limited ramp, so the speed at
         which the robot can still stop by ``s_stop`` allows this long before full braking (0: none,
@@ -141,10 +150,19 @@ class TadpoleDriver:
         cap = min(P.TARGET_V, a * (math.sqrt(stop_lag * stop_lag + 2.0 * d / a) - stop_lag))
         if v_cap is not None:
             cap = min(cap, v_cap)
+        if emergency:
+            cap = 0.0
+        if hard_brake_to is not None:
+            cap = min(cap, hard_brake_to)
         t0, s_st, v_st, a_st, parent, plan_mode = k.stitch_start(self.followed, path, t, 0.0, s0, vx, self.ax_f, cte)
-        traj = k.planner.plan(path, t0, s_st, v_st, a_st, v_cap=cap, ay_plan=float(P.AY_CURVE),
-                              duration=float(P.NMPC_HORIZON_T_MAX) + 1.4, parent=parent,
-                              decel_max=float(P.TRAJ_DECEL_MAX))
+        if emergency or hard_brake_to is not None:
+            traj = k.planner.plan(path, t0, s_st, v_st, a_st, v_cap=cap, ay_plan=float(P.AY_CURVE),
+                                  duration=float(P.NMPC_HORIZON_T_MAX) + 1.4, parent=parent,
+                                  decel_max=float(P.AX_EMERGENCY_DECEL), brake_jerk=1e3)
+        else:
+            traj = k.planner.plan(path, t0, s_st, v_st, a_st, v_cap=cap, ay_plan=float(P.AY_CURVE),
+                                  duration=float(P.NMPC_HORIZON_T_MAX) + 1.4, parent=parent,
+                                  decel_max=float(P.TRAJ_DECEL_MAX))
         t_solve = time.perf_counter()
         cmds = k.ctrl.step(X_global=m["X"], Y_global=m["Y"], psi_global=psi, vx=vx, vy=vy, r=r, delta=delta,
                            s0=s0, path=path, v_plan=float(P.V_MAX), dF_unmod_est=dF,
@@ -167,6 +185,14 @@ class TadpoleDriver:
             fx_drive = min(fx_drive, max(0.0, P.M * (P.AX_ACCEL_MAX - 0.2 - a_grav)))
             resist = self.loads.nominal_road_load(max(vx, 0.0))
             fx_brake = min(fx_brake, max(0.0, P.M * (P.AX_DECEL_MAX - 0.2 + a_grav) - resist))
+        if hold_brake > 0.0:
+            fx_drive = 0.0
+            fx_brake = max(fx_brake, hold_brake)
+            k.inner.v_integral = min(k.inner.v_integral, 0.0)
+        if emergency or (hard_brake_to is not None and vx > hard_brake_to + 0.2):
+            fx_drive = 0.0
+            fx_brake = max(fx_brake, float(P.FX_EMERGENCY_BRAKE_MAX))
+            k.inner.v_integral = min(k.inner.v_integral, 0.0)
         delta_cmd = float(np.clip(cmds["delta_cmd"], -np.deg2rad(P.MAX_STEER_DEG), np.deg2rad(P.MAX_STEER_DEG)))
         # Plant road loads: rolling resistance at the wheel, drag / side wind on the body at its centre of
         # pressure, extra grade at the CG (all nominal unless a disturbance scenario says otherwise).

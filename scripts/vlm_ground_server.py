@@ -3,6 +3,7 @@
     .venv/bin/python scripts/vlm_ground_server.py --config configs/sim_4b.yaml     # port 8765
 
 POST /ground  {"image_png_b64": "...", "query": "the blue barrel"}
+POST /text    {"prompt": "..."}  -> {"text": "...", "ms": 400.0}   (no image; the LoRA adapter is switched off)
   -> {"boxes": [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}], "raw": "...", "ms": 812.0}
 GET  /health  -> {"model": "...", "ready": true}
 
@@ -68,6 +69,9 @@ def main() -> None:
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):  # noqa: N802
+            if self.path == "/text":
+                self._text()
+                return
             if self.path != "/ground":
                 self._send(404, {"error": "not found"})
                 return
@@ -80,6 +84,21 @@ def main() -> None:
                     raw = "".join(assistant.oneshot(prompt, [load_image(img, cfg.media)]))
                     ms = (time.perf_counter() - t) * 1e3
                 self._send(200, {"boxes": parse_boxes(raw), "raw": raw, "ms": ms})
+            except Exception as e:  # report, keep serving
+                self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+        def _text(self):
+            """Plain text in, text out, with the base model (the fine-tuned driving adapter off)."""
+            import contextlib
+
+            try:
+                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                no_adapter = assistant.backend.model.disable_adapter() if args.adapter else contextlib.nullcontext()
+                with lock, no_adapter:
+                    t = time.perf_counter()
+                    text = "".join(assistant.oneshot(req["prompt"], []))
+                    ms = (time.perf_counter() - t) * 1e3
+                self._send(200, {"text": text, "ms": ms})
             except Exception as e:  # report, keep serving
                 self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
