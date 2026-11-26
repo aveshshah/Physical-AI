@@ -179,6 +179,8 @@ def build_drive_surface(stage, env: LocalEnvironment, prim_path: str, path: str 
         lo, g, Z, valid = _surface_heights(stage, env, prim_path)
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache, lo=lo, g=g, Z=Z, valid=valid)
+    global DRIVE_SURFACE
+    DRIVE_SURFACE = (np.asarray(lo, dtype=float), g, Z, valid)
     nx, ny = Z.shape
     vid = np.full((nx, ny), -1, dtype=np.int64)
     vid[valid] = np.arange(int(valid.sum()))
@@ -196,6 +198,89 @@ def build_drive_surface(stage, env: LocalEnvironment, prim_path: str, path: str 
     UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr("none")
     print(f"[env] drive surface: {len(pts)} vertices, {len(tri)} triangles at {g:.2f} m "
           f"({'from cache' if was_cached else 'built'} in {_time.time() - t0:.1f} s)")
+
+
+DRIVE_SURFACE = None  # (lo, grid, Z, valid) of the last drive surface built
+
+
+def drive_surface_height(x, y) -> np.ndarray:
+    """Road height at scene points (vectorised lookup in the drive-surface grid; NaN off the grid)."""
+    if DRIVE_SURFACE is None:
+        raise RuntimeError("no drive surface built")
+    lo, g, Z, valid = DRIVE_SURFACE
+    i = np.rint((np.asarray(x, dtype=float) - lo[0]) / g).astype(int)
+    j = np.rint((np.asarray(y, dtype=float) - lo[1]) / g).astype(int)
+    ok = (i >= 0) & (j >= 0) & (i < Z.shape[0]) & (j < Z.shape[1])
+    out = np.full(np.shape(i), np.nan)
+    out[ok] = np.where(valid[i[ok], j[ok]], Z[i[ok], j[ok]], np.nan)
+    return out
+
+
+PAVED_PRIMS = {"mcity": ("Terrain/PedestrianMeshes/Road_Road_MainRoads/SM_Roads_v2",
+                         "Terrain/StaticTerrainMeshes/SM_McityRoundabout_Concrete")}
+PAVED = None  # bool grid aligned with DRIVE_SURFACE: covered by a road mesh (not sidewalk, curb or ground)
+
+
+def build_paved_mask(stage, env_name: str, prim_path: str = "/World/Environment") -> np.ndarray:
+    """Which drive-surface grid nodes lie on road pavement (cached next to the drive surface)."""
+    import hashlib
+
+    from pxr import Usd, UsdGeom
+
+    global PAVED
+    lo, g, Z, _ = DRIVE_SURFACE
+    env = LOCAL_ENVIRONMENTS[env_name]
+    key = hashlib.sha1(repr((env.usd_path, os.path.getmtime(env.usd_path), tuple(lo), g, Z.shape,
+                             PAVED_PRIMS[env_name], 1)).encode()).hexdigest()[:16]
+    cache = Path(os.path.expanduser("~/.cache/talk2drive")) / f"paved_{key}.npz"
+    if cache.exists():
+        PAVED = np.load(cache)["paved"]
+        return PAVED
+    nx, ny = Z.shape
+    paved = np.zeros((nx, ny), dtype=bool)
+    xc = UsdGeom.XformCache(Usd.TimeCode.Default())
+    for rel in PAVED_PRIMS[env_name]:
+        root = stage.GetPrimAtPath(f"{prim_path}/{rel}")
+        for p in (Usd.PrimRange(root) if root.IsValid() else []):
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            m = UsdGeom.Mesh(p)
+            P = np.asarray(m.GetPointsAttr().Get(), dtype=float)
+            M = np.asarray(xc.GetLocalToWorldTransform(p), dtype=float)
+            W = (np.c_[P, np.ones(len(P))] @ M)[:, :2]
+            cnt = np.asarray(m.GetFaceVertexCountsAttr().Get())
+            idx = np.asarray(m.GetFaceVertexIndicesAttr().Get())
+            starts = np.r_[0, np.cumsum(cnt)[:-1]]
+            for s0, c in zip(starts, cnt):
+                for k in range(1, c - 1):
+                    A, B, C = W[idx[s0]], W[idx[s0 + k]], W[idx[s0 + k + 1]]
+                    i0, j0 = np.floor((np.minimum(np.minimum(A, B), C) - lo) / g).astype(int)
+                    i1, j1 = np.ceil((np.maximum(np.maximum(A, B), C) - lo) / g).astype(int)
+                    i0, j0, i1, j1 = max(i0, 0), max(j0, 0), min(i1, nx - 1), min(j1, ny - 1)
+                    if i1 < i0 or j1 < j0:
+                        continue
+                    d = (B[1] - C[1]) * (A[0] - C[0]) + (C[0] - B[0]) * (A[1] - C[1])
+                    if abs(d) < 1e-12:
+                        continue
+                    X, Y = np.meshgrid(lo[0] + g * np.arange(i0, i1 + 1), lo[1] + g * np.arange(j0, j1 + 1), indexing="ij")
+                    l1 = ((B[1] - C[1]) * (X - C[0]) + (C[0] - B[0]) * (Y - C[1])) / d
+                    l2 = ((C[1] - A[1]) * (X - C[0]) + (A[0] - C[0]) * (Y - C[1])) / d
+                    paved[i0:i1 + 1, j0:j1 + 1] |= (l1 >= -1e-6) & (l2 >= -1e-6) & (1 - l1 - l2 >= -1e-6)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache, paved=paved)
+    PAVED = paved
+    return paved
+
+
+def is_paved(x, y) -> np.ndarray:
+    """Whether scene points are on road pavement (False off the grid)."""
+    lo, g, Z, _ = DRIVE_SURFACE
+    i = np.rint((np.asarray(x, dtype=float) - lo[0]) / g).astype(int)
+    j = np.rint((np.asarray(y, dtype=float) - lo[1]) / g).astype(int)
+    ok = (i >= 0) & (j >= 0) & (i < Z.shape[0]) & (j < Z.shape[1])
+    out = np.zeros(np.shape(i), dtype=bool)
+    out[ok] = PAVED[i[ok], j[ok]]
+    return out
 
 
 def load_local_environment(stage, env: LocalEnvironment, prim_path: str = "/World/Environment") -> None:
@@ -263,6 +348,7 @@ class RobotSpec:
     kind: str = "diff"  # "diff": (left, right) wheel speeds | "ackermann": rear-wheel speed + front steering
     steer_dofs: tuple[str, str] | None = None  # ackermann: (left, right) steering joints
     steer_gains: tuple[float, float] = (3000.0, 300.0)  # steering servo stiffness [N m/rad], damping [N m s/rad]
+    susp_dofs: tuple[str, ...] = ()  # sprung struts (prismatic); rates, preload and anti-roll bar come from the USD
 
 
 ROBOTS = {
@@ -286,6 +372,19 @@ ROBOTS = {
         wheel_dofs=("rear_wheel_joint",),
         steer_dofs=("front_left_steer_joint", "front_right_steer_joint"),
         steer_gains=(20000.0, 600.0),  # ~30 ms servo: the tadpole NMPC assumes direct steering
+        kind="ackermann",
+        spawn_height=0.03,
+    ),
+    # The same robot on sprung, damped struts with a front anti-roll bar (build_robot_from_fbx.py
+    # --suspension; rates from ride frequency 1.8/2.0 Hz, damping ratio 0.3, roll gradient 3 deg/g).
+    "magna_susp": RobotSpec(
+        usd_path=str(REPO_ROOT / "assets/robots/magna_robot_susp.usd"),
+        params=dict(wheelbase=1.292, track=0.980, wheel_radius=0.22, max_speed=2.0, max_accel=1.0,
+                    max_steer=math.radians(35.0), max_steer_rate=math.radians(90.0)),
+        wheel_dofs=("rear_wheel_joint",),
+        steer_dofs=("front_left_steer_joint", "front_right_steer_joint"),
+        steer_gains=(20000.0, 600.0),
+        susp_dofs=("front_left_susp_joint", "front_right_susp_joint", "rear_susp_joint"),
         kind="ackermann",
         spawn_height=0.03,
     ),
@@ -389,6 +488,7 @@ class IsaacJetbot:
         self._steer_idx = (np.array([self.robot.get_dof_index(n) for n in spec.steer_dofs])
                            if spec.steer_dofs else None)
         self.torque_mode = False
+        self._load_suspension()
         self._restore_steering_gains()
         self._cmd = np.zeros(2)
         self._reset_encoders()
@@ -427,7 +527,54 @@ class IsaacJetbot:
         kps[self._steer_idx], kds[self._steer_idx] = self.spec.steer_gains
         if getattr(self, "torque_mode", False):  # rear motor driven by effort, not a speed target
             kps[self.robot.wheel_dof_indices], kds[self.robot.wheel_dof_indices] = 0.0, 0.0
+        if self._susp_idx is not None:
+            kps[self._susp_idx], kds[self._susp_idx] = self._susp_k, self._susp_c
         ctrl.set_gains(kps=kps, kds=kds)
+        self._hold_suspension()
+
+    # ---------------------------------------------------------------- suspension
+    def _load_suspension(self) -> None:
+        """Strut springs (preloaded drive targets), dampers and the anti-roll bar rate from the USD."""
+        self._susp_idx = None
+        if not self.spec.susp_dofs:
+            return
+        from pxr import UsdPhysics
+
+        stage = self.world.stage
+        k, c, x0 = [], [], []
+        for name in self.spec.susp_dofs:
+            prim = stage.GetPrimAtPath(f"/World/Jetbot/joints/{name}")
+            d = UsdPhysics.DriveAPI.Get(prim, "linear")
+            k.append(float(d.GetStiffnessAttr().Get()))
+            c.append(float(d.GetDampingAttr().Get()))
+            x0.append(float(d.GetTargetPositionAttr().Get()))
+        self._susp_idx = np.array([self.robot.get_dof_index(n) for n in self.spec.susp_dofs])
+        self._susp_k, self._susp_c, self._susp_target = np.array(k), np.array(c), np.array(x0)
+        self.arb_rate = float(stage.GetPrimAtPath("/World/Jetbot").GetCustomDataByKey("talk2drive:arb_rate") or 0.0)
+
+    def _hold_suspension(self) -> None:
+        """Spring free lengths as the struts' drive targets (resets clear them)."""
+        if self._susp_idx is None:
+            return
+        from isaacsim.core.utils.types import ArticulationAction
+
+        self.robot.apply_action(ArticulationAction(joint_positions=self._susp_target, joint_indices=self._susp_idx))
+
+    def _apply_anti_roll_bar(self) -> None:
+        """Front anti-roll bar: equal and opposite strut forces in proportion to the travel difference."""
+        if self._susp_idx is None or self.arb_rate <= 0.0:
+            return
+        from isaacsim.core.utils.types import ArticulationAction
+
+        z = np.asarray(self.robot.get_joint_positions(), dtype=float)[self._susp_idx[:2]]
+        f = self.arb_rate * (z[0] - z[1])
+        self.robot.apply_action(ArticulationAction(joint_efforts=np.array([-f, f]), joint_indices=self._susp_idx[:2]))
+
+    def suspension_travel(self) -> np.ndarray:
+        """Strut travel from design height [m], + = bump (front left, front right, rear)."""
+        if self._susp_idx is None:
+            return np.zeros(0)
+        return np.asarray(self.robot.get_joint_positions(), dtype=float)[self._susp_idx]
 
     # ---------------------------------------------------------------- force-level actuation
     def enable_torque_mode(self) -> None:
@@ -452,6 +599,7 @@ class IsaacJetbot:
         self.robot.apply_action(ArticulationAction(joint_positions=np.array(p.ackermann_angles(delta)),
                                                    joint_indices=self._steer_idx))
         q_dot = self._wheel_speed_all()  # rear, front-left, front-right [rad/s]
+        self.last_wheel_speeds = q_dot
         sgn = np.tanh(q_dot / 0.5)  # brakes oppose rotation, smoothly through standstill
         r = p.wheel_radius
         rear = fx_drive * r - (1 - front_brake_frac) * fx_brake * r * sgn[0] - fx_resist * r * sgn[0]
@@ -506,6 +654,7 @@ class IsaacJetbot:
         self.robot.apply_wheel_actions(ArticulationAction(joint_velocities=self._cmd))
 
     def step(self, render: bool | None = None) -> None:
+        self._apply_anti_roll_bar()
         self.world.step(render=self.render if render is None else render)
         self._update_encoders()
 

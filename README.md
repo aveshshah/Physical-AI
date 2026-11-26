@@ -191,6 +191,124 @@ transformers backend on an image and a video. It checks that preprocessing, the 
 video timestamps and streaming generation work with the installed `transformers` and
 `qwen-vl-utils` versions. Run it after upgrading either library.
 
+## Talk-to-Drive: VLM planner + NMPC on the Magna robot (Isaac Sim 6.2, Mcity)
+
+The vision model here also drives a robot in simulation. The Magna tadpole delivery robot (two
+front wheels, one rear) drives a 1,041 m route in the Mcity test track:
+
+* the speed and path tracker is the CARLA tadpole NMPC from `~/Documents/carla_nmpc_project`,
+  imported unchanged;
+* the behaviour and local planner is a fine-tuned **Qwen3-VL-4B**: it looks at the front camera
+  and decides whether to keep following the route, swerve left or right (and by how much), or stop.
+
+Plan and earlier milestones: [docs/TALK2DRIVE.md](docs/TALK2DRIVE.md). Isaac setup:
+[docs/ISAAC_SIM_SETUP.md](docs/ISAAC_SIM_SETUP.md).
+
+```
+ front camera ──► Qwen3-VL-4B + LoRA ──► {"blocker": {label, box}, "action": bypass_left, "offset_m": 1.2}
+ (route drawn                │
+  on the road)               ▼
+             depth in the box ──► where the blocker is ──► smooth sideways-shift path
+                                                              │  checked: stays on pavement,
+                                                              │  depth camera sees it clear
+                                                              ▼
+                                        CARLA tadpole NMPC (speed + steering) ──► robot
+             depth safety check: brake only (never steers)
+```
+
+### Road-load disturbances (M2)
+
+`sim/m2_mcity_tadpole_nmpc.py --disturbance <scenario>` changes the road and the air without
+telling the NMPC:
+
+* road friction (wet, low-µ, ice patches);
+* grade ±6 %;
+* wind with gusts;
+* extra drag and rolling resistance.
+
+`sim/run_disturbance_sweep.sh` runs every scenario, and `sim/summarise_disturbances.py` tabulates
+them. The NMPC holds its target speed within about 0.1–0.15 m/s RMS under grade, wind, drag and a
+combination of them; lap time changes by under 0.5 s. It fails on:
+
+* µ 0.35: the rear wheel spins;
+* µ 0.2 patches: the front wheels lock, because there is no ABS;
+* a 14 m/s storm with 21 m/s gusts: the robot rolls over.
+
+### Suspension
+
+`sim/build_robot_from_fbx.py --suspension` adds prismatic struts and a front anti-roll bar, scaled
+down from passenger-car data:
+
+| Setting | Value |
+|---|---|
+| Ride frequency | 1.8 Hz front, 2.0 Hz rear |
+| Damping ratio | 0.4 |
+| Roll gradient | 3°/g |
+| Wheel travel | 80 mm |
+
+The sprung robot is `--robot magna_susp`; `sim/check_suspension.py` checks it on flat ground. With
+the bend speed limit `--ay-curve 2.4`, the lap takes 125.5 s.
+
+### VLM behaviour planner (M3)
+
+1. **Data.** `sim/gen_planner_data.py` renders 4,000 Mcity camera images with obstacles placed
+   on the route. Each image is labelled from the scene geometry with follow / bypass_left /
+   bypass_right / stop, the offset and the blocker's box. `sim/m3_planner_testset.py` builds a
+   separate 36-image test set.
+2. **Fine-tune.** `scripts/finetune_planner.py` runs QLoRA on Qwen3-VL-4B:
+   * 4-bit NF4 base, LoRA r=16 on the language model, 2 epochs, about 1 h 45 min;
+   * the answer gives the blocker box first, then the action, and the action and offset count
+     5× in the loss.
+3. **Serve.** `scripts/vlm_ground_server.py --adapter runs/planner_lora`.
+4. **Drive.** `sim/m3_vlm_planner.py --prompt ft` places 5 obstacles on the route and runs the
+   lap with the window open.
+
+Accuracy on 400 held-out images:
+
+| Model | follow | bypass_left | bypass_right | stop | Overall | Offset error |
+|---|---|---|---|---|---|---|
+| Base Qwen3-VL-8B, no fine-tuning (36-image test set) | – | – | – | – | 64 % | – |
+| Fine-tuned 4B, first run (action written first) | 97 % | 94 % | 1 % | 13 % | 60 % | 0.42 m |
+| Fine-tuned 4B, box first, action weighted 5× | 97.5 % | 78 % | 68 % | 45 % | **77 %** | 0.21 m |
+
+Obstacle lap on Mcity (magna_susp, 4 blockers plus 2 side cones):
+
+| Run | Result |
+|---|---|
+| 1 | VLM switched side 13 m from the box and hit a cone |
+| 2 | Swerved over a 15 cm kerb (too low for the depth check) and got stuck |
+| 3 | Stopped cleanly before a box at a kerb corner: the VLM's offset was too small |
+| 4 | **Full lap, 0 collisions, 134.1 s**, closest gap 0.30 m |
+| Live rerun | **Full lap, 0 collisions, 127.5 s** (obstacle-free lap: 125.5 s); VLM about 1.06 s per answer |
+
+Fixes added after runs 1–3:
+
+* within 18 m of an obstacle, a change of side needs the depth camera to agree;
+* a swerve must keep the robot's edge on pavement (road map);
+* a swerve that is too tight is first widened on the VLM's side, in 0.4 m steps up to 1.2 m.
+
+What the VLM does: it decides every swerve, its side and its rough size, and which object is in the
+way. Without it the robot stops at the first obstacle, because the depth check can only brake.
+
+Not yet done:
+
+* the VLM's side choice is still imperfect: it handled 1 of 4 blockers without any check stepping
+  in during run 4;
+* it does not see obstacles closer than about 2 m;
+* each answer takes about 1–2 s.
+
+Run the lap (Isaac venv in `~/isaac-env`, VLM venv in `.venv`):
+
+```bash
+.venv/bin/python scripts/vlm_ground_server.py --config configs/sim_4b.yaml --adapter runs/planner_lora
+```
+
+```bash
+OMNI_KIT_ACCEPT_EULA=YES DISPLAY=:1 ~/isaac-env/bin/python sim/m3_vlm_planner.py --prompt ft
+```
+
+`runs/` is not committed: rebuild the data and the adapter with the scripts above.
+
 ## Layout
 
 ```
@@ -205,4 +323,6 @@ src/vlm_assistant/
 configs/             default / low_vram / edge_llamacpp
 scripts/             check_env.py, tiny_qwen3vl_smoke.py
 docs/ROADMAP.md      memory → planning → actions (NMPC) → robot
+src/talk2drive/      Isaac robot wrapper, Mcity route, tadpole NMPC driver, disturbances, VLM planner
+sim/                 Isaac Sim scripts (M1–M3, data generation, suspension check, sweeps)
 ```

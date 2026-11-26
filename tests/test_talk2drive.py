@@ -143,3 +143,38 @@ def test_opendrive_line_and_arc_sampling():
     arc = ET.fromstring('<geometry s="0" x="0" y="0" hdg="0" length="31.4159265" curvature="0.1"><arc curvature="0.1"/></geometry>')
     q = _sample_geometry(arc, 0.5)  # half circle of radius 10, turning left
     assert np.allclose(q[-1, :2], [0.0, 20.0], atol=1e-6) and abs(q[-1, 2] - np.pi) < 1e-6
+
+
+# ---------------------------------------------------------------- road-load disturbances
+class _P:
+    M, G, RHO_AIR, CD, A_FRONTAL, CRR, ROLLING_RESISTANCE_BLEND_SPEED = 300.0, 9.81, 1.225, 0.5, 1.0, 0.015, 0.3
+
+
+def test_nominal_road_load_has_no_unmodelled_force():
+    from talk2drive.disturbances import RoadLoadModel, parse_scenario
+
+    m = RoadLoadModel(parse_scenario("nominal"), _P, 1000.0)
+    for v in (0.5, 5.0, 15.0):
+        f = m.forces(100.0, v, 0.0, 0.7)
+        assert abs(f["dF_true"]) < 1e-9
+        assert abs(f["f_aero_y"]) < 1e-9
+
+
+def test_grade_wind_and_drag_signs():
+    import math
+
+    from talk2drive.disturbances import RoadLoadModel, parse_scenario
+
+    up = RoadLoadModel(parse_scenario("nominal:grade_offset_pct=5"), _P, 1000.0)
+    f = up.forces(0.0, 10.0, 0.0, 0.0)
+    assert f["dF_true"] == pytest.approx(-300 * 9.81 * 0.05 / math.sqrt(1.0025))  # uphill slows the car
+    head = RoadLoadModel(parse_scenario("nominal:wind_speed=10,wind_from_deg=0"), _P, 1000.0)
+    assert head.forces(0.0, 10.0, 0.0, 0.0)["dF_true"] < -50  # driving along +x into wind from +x
+    tail = RoadLoadModel(parse_scenario("nominal:wind_speed=10,wind_from_deg=180"), _P, 1000.0)
+    assert tail.forces(0.0, 10.0, 0.0, 0.0)["dF_true"] > 20
+    cross = RoadLoadModel(parse_scenario("nominal:wind_speed=10,wind_from_deg=90"), _P, 1000.0)
+    assert cross.forces(0.0, 10.0, 0.0, 0.0)["f_aero_y"] < -50  # wind from +y pushes towards -y
+    g = RoadLoadModel(parse_scenario("grade"), _P, 1000.0)
+    assert max(abs(g.grade(s)) for s in range(0, 1000, 2)) == pytest.approx(0.06, rel=0.02)
+    drag = RoadLoadModel(parse_scenario("drag"), _P, 1000.0)
+    assert drag.forces(0.0, 10.0, 0.0, 0.0)["dF_true"] < 0

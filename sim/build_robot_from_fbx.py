@@ -15,6 +15,11 @@ builds an articulation in a Z-up, metre, +x-forward frame with:
 * ``--layout diff``: the two front wheels are driven differentially and the rear wheel is a passive
   caster (swivel joint with trail). Origin: drive-axle midpoint on the ground.
 
+``--suspension`` (trike) puts each wheel on a sprung, damped vertical strut (prismatic joint with a
+linear drive preloaded so the chassis sits at its design height) and records a front anti-roll bar
+rate that the Isaac adapter applies between the two front struts. Rates come from ride frequency,
+damping ratio and target roll gradient, the way suspensions of real vehicles are specified.
+
 Colliders are a box for the body and spheres for the wheels (smooth rolling, one contact point),
 with a rubber material on the driven/steered tyres. Masses, motor torque and servo gains are not in
 the FBX: the defaults are assumptions and can be changed on the command line.
@@ -44,6 +49,12 @@ ap.add_argument("--caster-trail", type=float, default=0.06, help="m between swiv
 ap.add_argument("--tyre-friction", type=float, default=0.9, help="tyre-road friction (combine mode max, so the road's own value does not lower it)")
 ap.add_argument("--com", default=None, help="x,y,z of the chassis mass centre in the robot frame [m] (default: body centre, low)")
 ap.add_argument("--chassis-inertia", default=None, help="Ixx,Iyy,Izz of the chassis about its mass centre [kg m^2]")
+ap.add_argument("--suspension", action="store_true", help="trike: sprung, damped struts and a front anti-roll bar")
+ap.add_argument("--ride-freq", default="1.8,2.0", help="front,rear ride frequency [Hz] (cars 1-1.5 Hz, scaled up for size)")
+ap.add_argument("--damping-ratio", type=float, default=0.3, help="suspension damping ratio (cars 0.2-0.4)")
+ap.add_argument("--roll-gradient", type=float, default=3.0, help="target body roll per g of lateral acceleration [deg/g]")
+ap.add_argument("--travel", type=float, default=0.05, help="bump and rebound travel from design height [m]")
+ap.add_argument("--strut-mass", type=float, default=1.5, help="kg per strut (unsprung, with knuckle and wheel)")
 ap.add_argument("--shell", choices=["fbx", "magna"], default="fbx",
                 help="body visual: the FBX's own mesh, or a modelled Magna delivery-robot shell")
 ap.add_argument("--overall-height", type=float, default=2.0, help="m, top of the flag mast (magna shell)")
@@ -225,14 +236,26 @@ def build_magna_shell(stage, x_rear, x_front, roof, bed, mast_top, look) -> dict
 
 
 def build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_parts, centre, to_robot,
-                left_name, right_name, rear_name, wheel_I, tyre_look) -> None:
+                left_name, right_name, rear_name, wheel_I, tyre_look, prismatic=None) -> None:
     """Front: steering knuckle (servo about z) + free wheel; rear: driven wheel on a fixed axle."""
     Iw = (wheel_I[1], wheel_I[0], wheel_I[1])
     filtered = []
+    susp = suspension_rates(chassis, to_robot(centre[left_name])[0], to_robot(centre[right_name])[0]) if args.suspension else None
+
+    def mount(name, c, end):
+        """Chassis-side attachment of a wheel assembly: the chassis itself, or a sprung strut."""
+        if susp is None:
+            return "/robot/chassis", c
+        strut = link(f"/robot/{name}_strut", c, args.strut_mass, (0.01, 0.01, 0.01))
+        prismatic(f"/robot/joints/{name}_susp_joint", "/robot/chassis", strut.GetPath(), c, *susp[end])
+        filtered.append(str(strut.GetPath()))
+        return strut.GetPath(), (0, 0, 0)
+
     for side, bone in (("front_left", left_name), ("front_right", right_name)):
         c = to_robot(centre[bone])[0]
+        parent, at = mount(side, c, "front")
         knuckle = link(f"/robot/{side}_knuckle", c, 2.0, (0.02, 0.02, 0.02))
-        revolute(f"/robot/joints/{side}_steer_joint", "/robot/chassis", knuckle.GetPath(), c, "Z",
+        revolute(f"/robot/joints/{side}_steer_joint", parent, knuckle.GetPath(), at, "Z",
                  drive=False, servo=True, limit_deg=args.max_steer)
         w = link(f"/robot/{side}_wheel", c, args.wheel_mass, Iw)
         visual(f"/robot/{side}_wheel/visual", wheel_parts[bone], c, tyre_look)
@@ -243,9 +266,45 @@ def build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_pa
     w = link("/robot/rear_wheel", c, args.wheel_mass, Iw)
     visual("/robot/rear_wheel/visual", wheel_parts[rear_name], c, tyre_look)
     wheel_collider("/robot/rear_wheel/collision")
-    revolute("/robot/joints/rear_wheel_joint", "/robot/chassis", w.GetPath(), c, "Y", drive=True)
+    parent, at = mount("rear", c, "rear")
+    revolute("/robot/joints/rear_wheel_joint", parent, w.GetPath(), at, "Y", drive=True)
     filtered.append(str(w.GetPath()))
     UsdPhysics.FilteredPairsAPI.Apply(chassis.GetPrim()).CreateFilteredPairsRel().SetTargets(filtered)
+    if susp is not None:
+        stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:arb_rate", susp["arb_rate"])
+        stage.GetPrimAtPath("/robot").SetCustomDataByKey("talk2drive:suspension", susp["report"])
+
+
+def suspension_rates(chassis, c_left, c_right) -> dict:
+    """Spring, damper and anti-roll-bar rates from ride frequency, damping ratio and roll gradient.
+
+    Sprung mass is the chassis; its share on each axle follows the mass centre. Only the front axle
+    can resist roll (one rear wheel on the centreline), so the anti-roll bar is at the front. The
+    struts slide vertically, so the roll centre is on the ground and the roll arm is the CG height.
+    """
+    m = UsdPhysics.MassAPI(chassis.GetPrim())
+    ms = float(m.GetMassAttr().Get())
+    com = m.GetCenterOfMassAttr().Get()
+    L, t, h = float(c_left[0]), float(c_left[1] - c_right[1]), float(com[2])
+    f_front, f_rear = (float(v) for v in args.ride_freq.split(","))
+    m_front_corner = ms * float(com[0]) / L / 2  # rear axle at x = 0
+    m_rear = ms * (1 - float(com[0]) / L)
+    k_f = m_front_corner * (2 * math.pi * f_front) ** 2
+    k_r = m_rear * (2 * math.pi * f_rear) ** 2
+    c_f = 2 * args.damping_ratio * math.sqrt(k_f * m_front_corner)
+    c_r = 2 * args.damping_ratio * math.sqrt(k_r * m_rear)
+    roll_moment_per_g = ms * 9.81 * h
+    k_phi = roll_moment_per_g / math.radians(args.roll_gradient)
+    k_phi_springs = k_f * t * t / 2
+    arb_rate = max(0.0, (k_phi - k_phi_springs) / (t * t))  # N/m on the left-right strut difference
+    report = {"ride_freq_hz": [f_front, f_rear], "damping_ratio": args.damping_ratio, "roll_gradient_deg_per_g": args.roll_gradient,
+              "spring_N_per_m": [round(k_f), round(k_r)], "damper_N_s_per_m": [round(c_f), round(c_r)],
+              "static_deflection_mm": [round(1000 * 9.81 / (2 * math.pi * f_front) ** 2), round(1000 * 9.81 / (2 * math.pi * f_rear) ** 2)],
+              "roll_stiffness_springs_Nm_per_rad": round(k_phi_springs), "roll_stiffness_total_Nm_per_rad": round(k_phi),
+              "arb_rate_N_per_m": round(arb_rate), "travel_m": args.travel}
+    print("[build] suspension:", report)
+    load_f, load_r = m_front_corner * 9.81, m_rear * 9.81  # spring preload holds the chassis at design height
+    return {"front": (k_f, c_f, load_f), "rear": (k_r, c_r, load_r), "arb_rate": arb_rate, "report": str(report)}
 
 
 def main() -> None:
@@ -371,6 +430,27 @@ def main() -> None:
             d.CreateTargetVelocityAttr(0.0)
         return j
 
+    def prismatic(path, b0, b1, pos0, k, c, preload):
+        """Vertical strut: + = wheel moves up (bump). The drive's target is the free length, so the
+        spring carries ``preload`` at zero travel (design ride height)."""
+        j = UsdPhysics.PrismaticJoint.Define(stage, path)
+        j.CreateBody0Rel().SetTargets([b0])
+        j.CreateBody1Rel().SetTargets([b1])
+        j.CreateAxisAttr("Z")
+        j.CreateLocalPos0Attr(Gf.Vec3f(*map(float, pos0)))
+        j.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
+        j.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
+        j.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
+        j.CreateLowerLimitAttr(-args.travel)
+        j.CreateUpperLimitAttr(args.travel)
+        d = UsdPhysics.DriveAPI.Apply(j.GetPrim(), "linear")
+        d.CreateTypeAttr("force")
+        d.CreateStiffnessAttr(k)
+        d.CreateDampingAttr(c)
+        d.CreateMaxForceAttr(1e6)
+        d.CreateTargetPositionAttr(-preload / k)
+        return j
+
     # chassis: body box collider; mass centre at the body centre, low
     bmin, bmax = to_robot(body["min"])[0], to_robot(body["max"])[0]
     lo, hi = np.minimum(bmin, bmax), np.maximum(bmin, bmax)
@@ -402,7 +482,7 @@ def main() -> None:
     wheel_I = (0.5 * args.wheel_mass * radius**2, 0.25 * args.wheel_mass * radius**2 + args.wheel_mass * width**2 / 12)
     if args.layout == "trike":
         build_trike(stage, link, visual, wheel_collider, revolute, chassis, wheel_parts, centre, to_robot,
-                    left_name, right_name, rear_name, wheel_I, tyre_look)
+                    left_name, right_name, rear_name, wheel_I, tyre_look, prismatic=prismatic)
         meta = root.GetPrim()
         for k, v in {"wheel_radius": radius, "wheelbase": wheelbase, "track": track}.items():
             meta.SetCustomDataByKey(f"talk2drive:{k}", v)

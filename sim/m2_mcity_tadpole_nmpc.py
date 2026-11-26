@@ -3,6 +3,8 @@
     python sim/m2_mcity_tadpole_nmpc.py                      # one lap, GUI, chase camera
     python sim/m2_mcity_tadpole_nmpc.py --headless --record  # GIF + logs, no window
     python sim/m2_mcity_tadpole_nmpc.py --style comfort      # the project's default comfort plan
+    python sim/m2_mcity_tadpole_nmpc.py --disturbance wind   # road-load uncertainty (see talk2drive.disturbances)
+    python sim/m2_mcity_tadpole_nmpc.py --disturbance "nominal:mu=0.5,grade_pct=3"
 
 Defaults are the fastest configuration that passes every rule (tuned 25 Nov 2026): the project's
 ``sport`` style (its lap-time tuning), its speed-scheduled horizon, V_MAX 15 m/s.
@@ -45,6 +47,9 @@ ap.add_argument("--route-start", default="104,1", help="road id,direction (+1 al
 ap.add_argument("--route-seed", type=int, default=1)
 ap.add_argument("--v-max", type=float, default=15.0, help="NMPC_V_MAX [m/s]")
 ap.add_argument("--style", default="sport", help="DRIVE_STYLE of the CARLA project: sport (lap time) | comfort")
+ap.add_argument("--ay-curve", type=float, default=None,
+                help="lateral acceleration the speed plan uses on bends [m/s^2] (sport: 0.55*AY_MAX = 1.65); "
+                     "capped at the AY_MAX rollover envelope")
 ap.add_argument("--no-speed-horizon", action="store_true",
                 help="fixed 0.8 s horizon instead of the project's opt-in speed-scheduled one (0.8 -> 1.6 s)")
 ap.add_argument("--max-time", type=float, default=400.0, help="s of simulated time before giving up")
@@ -52,6 +57,11 @@ ap.add_argument("--start-s", type=float, default=0.0, help="start this far along
 ap.add_argument("--contacts", action="store_true", help="print every contact that is not tyre-on-road (debugging)")
 ap.add_argument("--no-grade-governor", action="store_true",
                 help="do not cap drive force on downhill grades (Mcity has up to 9 %%; the CARLA towns are flat)")
+ap.add_argument("--disturbance", default="nominal",
+                help="road-load scenario the NMPC is not told about: nominal | wet | low_mu | ice_patches | grade | "
+                     "wind | storm | drag | combined, optionally with overrides, e.g. wind:wind_speed=12")
+ap.add_argument("--robot", default="magna", help="magna (rigid chassis) | magna_susp (sprung struts, front anti-roll bar)")
+ap.add_argument("--baseline", default=None, help="log.npz of an undisturbed lap, to compare speed at the same s")
 ap.add_argument("--headless", action="store_true")
 ap.add_argument("--record", action="store_true")
 ap.add_argument("--record-every", type=float, default=0.5)
@@ -70,55 +80,11 @@ app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720})
 
 import numpy as np  # noqa: E402
 
-from talk2drive.isaac.jetbot import LOCAL_ENVIRONMENTS, IsaacJetbot  # noqa: E402
-from talk2drive.opendrive import OpenDrive, RoutePath  # noqa: E402
-
-MAGNA_L, MAGNA_LF = 1.292, 0.65  # wheelbase, CG behind the front axle (tadpole_params: LF = 0.65/1.292 L)
-
-
-def load_tadpole_stack(nmpc_dir: str, build_dir: Path):
-    """Import the CARLA project's NMPC stack with the Magna geometry; compile its solver in build_dir."""
-    sys.path.insert(0, nmpc_dir)
-    import tadpole_params as P
-
-    P.L, P.LF = MAGNA_L, MAGNA_LF
-    P.LR = P.L - P.LF
-    P.KUS = P.M * (P.LR * P.CR - P.LF * P.CF) / (P.L * P.CF * P.CR)
-    P.POSE_POINT_TO_CG_X = P.LR
-    P.CARLA_ACTOR_TO_REAR_X = P.LR
-    build_dir.mkdir(parents=True, exist_ok=True)
-    cwd = os.getcwd()
-    os.chdir(build_dir)  # acados writes c_generated_code/ and the solver json into the working directory
-    try:
-        from nmpc_controller import TadpoleNMPCController
-
-        ctrl = TadpoleNMPCController()
-    finally:
-        os.chdir(cwd)
-    from force_disturbance_observer import LongitudinalForceDisturbanceObserver
-    from inner_loop import InnerLoopTracker
-    from trajectory import RouteSpeedPlanner, stitch_start
-
-    inner = InnerLoopTracker(m=P.M, Tw=P.TW_FRONT, kp_v=1000.0, ki_v=200.0, ki_v_2dof=30.0,
-                             v_integral_max_2dof=20.0, Fx_drive_max=P.FX_DRIVE_MAX, Fx_brake_max=P.FX_BRAKE_MAX)
-    return P, ctrl, RouteSpeedPlanner(), stitch_start, LongitudinalForceDisturbanceObserver(Ts=P.NMPC_TS), inner
-
-
-def mcity_route(xodr: str, start: str, seed: int) -> tuple[RoutePath, float, list]:
-    """One lap of a lane-following loop, in the Isaac scene frame, plus 40 m run-out past the start."""
-    od = OpenDrive(xodr)
-    rid, d = start.split(",")
-    route = od.find_loop((rid, int(d)), min_length=500, max_length=1100, tries=3000, seed=seed)
-    pts, widths = od.route_points(route)
-    env = LOCAL_ENVIRONMENTS["mcity"]
-    c, s = math.cos(math.radians(env.yaw_deg)), math.sin(math.radians(env.yaw_deg))
-    q = pts - np.asarray(env.origin[:2])
-    sim = np.c_[c * q[:, 0] - s * q[:, 1], s * q[:, 0] + c * q[:, 1]]
-    lap = RoutePath(sim, closed=True)
-    runout = int(40.0 / lap.ds)
-    path = RoutePath(np.r_[lap.xy, lap.xy[1:runout]], smooth_m=0.0)
-    return path, lap.length, [float(np.median(widths))], route
-
+from talk2drive.disturbances import BodyForceApplier, RoadLoadModel, apply_road_friction, parse_scenario  # noqa: E402
+from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
+from talk2drive.tadpole import TadpoleDriver, load_tadpole_stack  # noqa: E402
+from talk2drive.mcity import mcity_route  # noqa: E402
+from talk2drive.opendrive import RoutePath  # noqa: E402
 
 def make_chase_camera(bot):
     from isaacsim.core.utils.viewports import set_camera_view
@@ -175,6 +141,102 @@ def score(log: dict, P, lane_width: float, lap_length: float) -> dict:
         "nmpc": {"mean_solve_ms": float(np.mean(log["solve_ms"])), "max_solve_ms": float(np.max(log["solve_ms"])),
                  "non_zero_status": int(np.sum(np.asarray(log["status"]) != 0))},
     }
+
+
+def _baseline_speed(baseline: str | None, s: np.ndarray):
+    if not baseline or not os.path.exists(baseline):
+        return None
+    b = np.load(baseline)
+    bs, bv = np.asarray(b["s"]), np.asarray(b["vx"])
+    order = np.argsort(bs)
+    return np.interp(s, bs[order], bv[order])
+
+
+def speed_tracking(log: dict, P, baseline: str | None, metrics: dict) -> dict:
+    """Does the NMPC still hold the target speed? Against its own reference and against an undisturbed lap."""
+    vx, vref, s = (np.asarray(log[k]) for k in ("vx", "v_ref", "s"))
+    moving = vref > 0.5
+    e = (vx - vref)[moving]
+    mode = np.asarray(log["plan_mode"])
+    dF, dF_true = np.asarray(log["dF"]), np.asarray(log["dF_true"])
+    wheel = np.asarray(log["wheel_rear"]) * 0.22  # rear-wheel surface speed (r = 0.22 m)
+    fast = vx > 2.0
+    slip = (wheel[fast] - vx[fast]) / vx[fast]
+    out = {
+        "vs_nmpc_reference": {"rmse": float(np.sqrt(np.mean(e ** 2))), "mean": float(e.mean()),
+                              "p95_abs": float(np.percentile(np.abs(e), 95)), "max_below": float(-e.min()),
+                              "max_above": float(e.max()), "time_off_by_more_than_0.5_s": float(np.sum(np.abs(e) > 0.5) * P.NMPC_TS)},
+        "plan_restarts": {"description": "plans restarted from the measured state because the robot was not on the previous plan (stitch_start)",
+                          "count": int(np.sum((mode[1:] != 0) & (mode[:-1] == 0))),
+                          "time_off_plan_s": float(np.sum(mode[1:] != 0) * P.NMPC_TS)},
+        "observer": {"description": "LongitudinalForceDisturbanceObserver estimate vs the injected unmodelled force [N]",
+                     "rmse_N": float(np.sqrt(np.mean((dF - dF_true)[fast] ** 2))) if fast.any() else float("nan"),
+                     "true_mean_N": float(dF_true[fast].mean()) if fast.any() else float("nan"),
+                     "true_range_N": [float(dF_true[fast].min()), float(dF_true[fast].max())] if fast.any() else [],
+                     "correlation": float(np.corrcoef(dF[fast], dF_true[fast])[0, 1]) if fast.sum() > 2 and np.std(dF_true[fast]) > 1 else None},
+        "rear_wheel_slip": {"max_drive": float(slip.max()) if fast.any() else 0.0,
+                            "max_brake": float(-slip.min()) if fast.any() else 0.0},
+    }
+    vb = _baseline_speed(baseline, s)
+    if vb is not None:
+        d = (vx - vb)[moving]
+        b = np.load(baseline)
+        bt, bs = np.asarray(b["t"]), np.asarray(b["s"])
+        lap = metrics["lap_length_m"]
+        b_lap = float(bt[np.argmax(bs >= lap - 0.5)]) if bs[-1] >= lap - 0.5 else float("nan")
+        out["vs_undisturbed_lap"] = {"rmse": float(np.sqrt(np.mean(d ** 2))), "mean": float(d.mean()),
+                                     "max_below": float(-d.min()), "max_above": float(d.max()),
+                                     "lap_time_baseline_s": b_lap, "lap_time_delta_s": metrics["lap_time_s"] - b_lap}
+    return out
+
+
+def plot_disturbance(log: dict, P, out: Path, metrics: dict, baseline: str | None) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    s = np.asarray(log["s"])
+    fig, ax = plt.subplots(5, 1, figsize=(13, 12), sharex=True)
+    vb = _baseline_speed(baseline, s)
+    ax[0].plot(s, log["v_ref"], lw=0.9, label="NMPC reference")
+    if vb is not None:
+        ax[0].plot(s, vb, lw=0.9, color="0.55", ls="--", label="undisturbed lap")
+    ax[0].plot(s, log["vx"], lw=1.2, label="speed")
+    ax[0].set_ylabel("m/s")
+    ax[0].legend(fontsize=8, ncol=3)
+    ax[1].plot(s, np.asarray(log["vx"]) - np.asarray(log["v_ref"]), lw=1, label="speed - reference")
+    if vb is not None:
+        ax[1].plot(s, np.asarray(log["vx"]) - vb, lw=0.8, color="0.5", label="speed - undisturbed")
+    off = np.asarray(log["plan_mode"]) != 0
+    if off.any():
+        ax[1].scatter(s[off], np.zeros(off.sum()), s=4, color="r", zorder=3, label="plan restarted")
+    ax[1].set_ylabel("m/s")
+    ax[1].legend(fontsize=8, ncol=3)
+    ax[2].plot(s, log["dF_true"], lw=1, color="k", label="injected unmodelled force (incl. Mcity grade)")
+    ax[2].plot(s, log["dF"], lw=1, label="observer estimate dF")
+    ax[2].set_ylabel("N")
+    ax[2].legend(fontsize=8)
+    ax[3].plot(s, 100 * np.asarray(log["grade_extra"]), lw=1, label="extra grade [%]")
+    ax[3].plot(s, -100 * np.tan(np.asarray(log["pitch"])), lw=0.8, label="Mcity grade [%]")
+    ax[3].plot(s, np.hypot(log["wind_x"], log["wind_y"]), lw=0.8, label="wind speed [m/s]")
+    ax[3].plot(s, 10 * np.asarray(log["mu_road"]), lw=0.8, label="road mu x10")
+    ax[3].legend(fontsize=8, ncol=4)
+    ax[4].plot(s, np.degrees(log["delta_cmd"]), lw=0.8, label="steer cmd [deg]")
+    ax[4].plot(s, 100 * np.asarray(log["cte"]), lw=0.8, label="CTE [cm]")
+    ax[4].plot(s, np.degrees(log["roll"]), lw=0.8, label="roll [deg]")
+    ax[4].legend(fontsize=8, ncol=3)
+    ax[4].set_xlabel("distance along route [m]")
+    for a in ax:
+        a.grid(alpha=0.3)
+    st = metrics["speed_tracking"]["vs_nmpc_reference"]
+    fig.suptitle(f"{metrics['disturbance']['name']}: {metrics['disturbance']['description']}\n"
+                 f"lap {metrics['lap_time_s']:.1f} s, speed error RMSE {st['rmse']:.2f} m/s (p95 {st['p95_abs']:.2f})")
+    fig.tight_layout()
+    p = out / "disturbance.png"
+    fig.savefig(p, dpi=100)
+    plt.close(fig)
+    return p
 
 
 def plot(log: dict, path: RoutePath, lap_length: float, P, out: Path, metrics: dict) -> Path:
@@ -234,7 +296,8 @@ def plot(log: dict, path: RoutePath, lap_length: float, P, out: Path, metrics: d
 def main() -> None:
     out = (REPO / args.out) if not os.path.isabs(args.out) else Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    P, ctrl, planner, stitch_start, observer, inner = load_tadpole_stack(args.nmpc_dir, out / "solver_build")
+    stack = load_tadpole_stack(args.nmpc_dir, out / "solver_build", ay_curve=args.ay_curve)
+    P = stack.P
     path, lap_length, (lane_width,), route = mcity_route(args.xodr, args.route_start, args.route_seed)
     print(f"[m2] route: {len(route)} roads, lap {lap_length:.0f} m, lane width {lane_width:.2f} m; "
           f"V_MAX {P.V_MAX:g} m/s, style {P.DRIVE_STYLE}, AY_CURVE {P.AY_CURVE:.2f}, AY_MAX {P.AY_MAX:.2f} m/s^2")
@@ -244,9 +307,15 @@ def main() -> None:
     i0 = int(args.start_s / path.ds)
     x0, y0 = path.xy[i0]
     psi0 = path.heading(args.start_s)
-    bot = IsaacJetbot(env="mcity", robot="magna", physics_dt=physics_dt, start_pose=(x0, y0, psi0), render=True)
+    bot = IsaacJetbot(env="mcity", robot=args.robot, physics_dt=physics_dt, start_pose=(x0, y0, psi0), render=True)
     bot.enable_torque_mode()
-    bot.reset_to((x0, y0, psi0))
+    scenario = parse_scenario(args.disturbance)
+    patches = apply_road_friction(bot.world.stage, scenario, path)
+    loads = RoadLoadModel(scenario, P, lap_length, dt=TS)
+    body_forces = BodyForceApplier("/World/Jetbot/chassis")
+    print(f"[m2] road loads: {scenario.name}: {scenario.describe()}"
+          + (f"; patches {[(round(a), round(b), m) for a, b, m in patches]}" if patches else ""))
+    bot.reset_to((x0, y0, psi0))  # the world reset re-parses physics, picking up the road materials
     bot.params.max_steer = float(np.deg2rad(P.MAX_STEER_DEG))  # the servo may go to the physical limit
     contact_reader = None
     if args.contacts:
@@ -279,9 +348,6 @@ def main() -> None:
                       f"n={len(pts)} impulse={imp:7.2f} N s sep={sep*100:+.1f} cm normal=({nrm[0]:+.2f},{nrm[1]:+.2f},{nrm[2]:+.2f}) "
                       f"at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
     camera = make_chase_camera(bot)
-    ctrl.reset()
-    observer.reset(vx=0.0)
-    inner.reset()
 
     frames = out / "frames"
     if args.record:
@@ -293,110 +359,56 @@ def main() -> None:
         vp = get_active_viewport()
 
     keys = ("t", "x", "y", "psi", "vx", "vy", "r", "delta", "delta_cmd", "fx_drive", "fx_brake", "s", "cte", "epsi",
-            "v_ref", "status", "solve_ms", "dF", "roll", "pitch", "z")
+            "v_ref", "status", "solve_ms", "dF", "roll", "pitch", "z",
+            "dF_true", "grade_extra", "wind_x", "wind_y", "f_aero_y", "plan_mode", "wheel_rear", "mu_road",
+            "susp_fl", "susp_fr", "susp_r")
+    patch_s = [(a, b, m) for a, b, m in patches]
     log = {k: [] for k in keys}
-    prev = None
-    s_hint, followed, fx_prev, ax_f, n_frame = args.start_s, None, 0.0, 0.0, 0
+    driver = TadpoleDriver(stack, bot, loads, body_forces, grade_governor=not args.no_grade_governor)
+    driver.set_path(path, s_hint=args.start_s)
+    n_frame = 0
     s_stop = lap_length
     wall0 = time.perf_counter()
     k = 0
     while k * TS < args.max_time and app.is_running():
         t = k * TS
-        pos, quat = bot.robot.get_world_pose()
-        X, Y = float(pos[0]), float(pos[1])
-        st = bot.get_state()
-        psi, delta = float(st[2]), float(st[4])
-        # Velocities at the centre of mass (as the CARLA actor reports them). The pose point is on the
-        # ground under the rear axle, 0.45 m below the CG, so body pitch/roll would swing it fore-aft
-        # and sideways and read as phantom acceleration.
-        qw_, qx_, qy_, qz_ = (float(v) for v in quat)
-        Rb = np.array([[1 - 2 * (qy_ * qy_ + qz_ * qz_), 2 * (qx_ * qy_ - qz_ * qw_), 2 * (qx_ * qz_ + qy_ * qw_)],
-                       [2 * (qx_ * qy_ + qz_ * qw_), 1 - 2 * (qx_ * qx_ + qz_ * qz_), 2 * (qy_ * qz_ - qx_ * qw_)],
-                       [2 * (qx_ * qz_ - qy_ * qw_), 2 * (qy_ * qz_ + qx_ * qw_), 1 - 2 * (qx_ * qx_ + qy_ * qy_)]])
-        cg = np.asarray(pos, dtype=float) + Rb @ np.array([P.LR, 0.0, P.H_CG])
-        if prev is None:
-            vx = vy = r = 0.0
-        else:
-            vwx, vwy = (cg[0] - prev[0]) / TS, (cg[1] - prev[1]) / TS
-            r = ((psi - prev[2] + math.pi) % (2 * math.pi) - math.pi) / TS
-            c, s_ = math.cos(psi), math.sin(psi)
-            vx = c * vwx + s_ * vwy
-            vy = -s_ * vwx + c * vwy
-        ax_meas = 0.0 if prev is None else (vx - prev[3]) / TS
-        ax_f += 0.3 * (ax_meas - ax_f)
-        prev = (float(cg[0]), float(cg[1]), psi, vx)
-
-        s0, cte = path.project(X, Y, s_hint)
-        s_hint = s0
-        epsi = (psi - path.heading(s0) + math.pi) % (2 * math.pi) - math.pi
-
-        obs = observer.update(vx=vx, vy=vy, r=r, delta=delta, Fx_command_previous_interval=fx_prev,
-                              ax_body_measured=ax_meas if k > 1 else None, mu_est=P.MU)
-        dF = float(obs.estimate)
-
-        # route end: stop on the start line after one lap, braking at the 1B command limit
-        v_cap = min(P.TARGET_V, math.sqrt(max(0.0, 2.0 * P.AX_DECEL_CMD * (s_stop - s0 - 0.5))))
-        t0, s_st, v_st, a_st, parent, _mode = stitch_start(followed, path, t, 0.0, s0, vx, ax_f, cte)
-        traj = planner.plan(path, t0, s_st, v_st, a_st, v_cap=v_cap, ay_plan=float(P.AY_CURVE),
-                            duration=float(P.NMPC_HORIZON_T_MAX) + 1.4, parent=parent,
-                            decel_max=float(P.TRAJ_DECEL_MAX))
-        t_solve = time.perf_counter()
-        cmds = ctrl.step(X_global=X, Y_global=Y, psi_global=psi, vx=vx, vy=vy, r=r, delta=delta,
-                         s0=s0, path=path, v_plan=float(P.V_MAX), dF_unmod_est=dF,
-                         ay_max=P.AY_MAX, ay_plan=float(P.AY_CURVE), mu_est=P.MU,
-                         Mz_min_avail=0.0, Mz_max_avail=0.0, Mz_applied_est=0.0, sim_time=t,
-                         trajectory=traj, v_plan_target=None, v_plan_rate=0.0, mu_front_est=P.MU)
-        solve_ms = (time.perf_counter() - t_solve) * 1e3
-        followed = traj
-        fx_drive, fx_brake = inner.track_speed_2dof(Fx_ff=cmds["Fx_net_nmpc"], v_cmd=cmds["v_cmd"], v_meas=vx, dt=TS)
-        fx_drive = float(np.clip(fx_drive, 0.0, P.FX_DRIVE_MAX))
-        if not args.no_grade_governor:
-            # GRADE_GOVERNOR: FX_DRIVE_MAX = M * AX_ACCEL_MAX bounds the acceleration on flat ground only.
-            # Downhill, gravity adds g*sin(pitch); cap the drive force so drive + gravity stays within
-            # AX_ACCEL_MAX less the same 0.2 m/s^2 headroom the project keeps for braking (Rule 1B).
-            qw_, qx_, qy_, qz_ = (float(v) for v in quat)
-            a_grav = P.G * max(-1.0, min(1.0, 2 * (qw_ * qy_ - qz_ * qx_)))  # +ve nose down (downhill)
-            fx_drive = min(fx_drive, max(0.0, P.M * (P.AX_ACCEL_MAX - 0.2 - a_grav)))
-        fx_brake = float(np.clip(fx_brake, 0.0, P.FX_BRAKE_MAX))
-        delta_cmd = float(np.clip(cmds["delta_cmd"], -np.deg2rad(P.MAX_STEER_DEG), np.deg2rad(P.MAX_STEER_DEG)))
-        road_load = 0.5 * P.RHO_AIR * P.CD * P.A_FRONTAL * vx * vx + P.CRR * P.M * P.G * math.tanh(
-            vx / P.ROLLING_RESISTANCE_BLEND_SPEED)
-        bot.apply_forces(delta_cmd, fx_drive, fx_brake, front_brake_frac=P.FRONT_BRAKE_FRAC,
-                         fx_resist=abs(road_load), dt=TS)
-        fx_prev = fx_drive - fx_brake
-
-        qw, qx, qy, qz = (float(v) for v in quat)
-        roll = math.atan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
-        pitch = math.asin(max(-1.0, min(1.0, 2 * (qw * qy - qz * qx))))
-        for i, v in zip(keys, (t, X, Y, psi, vx, vy, r, delta, delta_cmd, fx_drive, fx_brake, s0, cte, epsi,
-                               float(cmds["v_ref"]), int(cmds["status"]), solve_ms, dF, roll, pitch, float(pos[2]))):
-            log[i].append(v)
+        row = driver.tick(t, s_stop)
+        s0, vx, cte, roll = row["s"], row["vx"], row["cte"], row["roll"]
+        row["mu_road"] = next((m for a, b, m in patch_s if a <= s0 <= b), scenario.mu)
+        for key in keys:
+            log[key].append(row[key])
         if k % 50 == 0:
-            print(f"[m2] t={t:6.1f}s s={s0:7.1f}/{lap_length:.0f} m v={vx:5.2f} (ref {cmds['v_ref']:5.2f}) m/s "
-                  f"cte={cte * 100:+6.1f} cm epsi={math.degrees(epsi):+5.1f} deg steer={math.degrees(delta_cmd):+6.1f} deg "
-                  f"Fx={fx_drive - fx_brake:+6.0f} N solve={solve_ms:4.1f} ms status={cmds['status']}")
+            print(f"[m2] t={t:6.1f}s s={s0:7.1f}/{lap_length:.0f} m v={vx:5.2f} (ref {row['v_ref']:5.2f}) m/s "
+                  f"cte={cte * 100:+6.1f} cm epsi={math.degrees(row['epsi']):+5.1f} deg "
+                  f"steer={math.degrees(row['delta_cmd']):+6.1f} deg Fx={row['fx_drive'] - row['fx_brake']:+6.0f} N "
+                  f"solve={row['solve_ms']:4.1f} ms status={row['status']}")
 
         if not args.headless:
-            camera(X, Y, psi)
+            camera(row["x"], row["y"], row["psi"])
         if args.record and t + 1e-9 >= n_frame * args.record_every:
             capture_viewport_to_file(vp, file_path=str(frames / f"{n_frame:04d}.png"))
             n_frame += 1
-        bot.step(render=False)
-        bot.step(render=not args.headless or args.record)
+        driver.step(render=not args.headless or args.record)
         if contact_reader is not None:
             contact_reader(t)
         k += 1
         if s0 >= s_stop - 1.0 and vx < 0.05:
             break
+        if abs(roll) > math.radians(45) or abs(cte) > 3.0:
+            print(f"[m2] FAILED at t={t:.1f} s, s={s0:.0f} m: roll {math.degrees(roll):.0f} deg, cte {cte:.2f} m")
+            break
 
     wall = time.perf_counter() - wall0
     metrics = score(log, P, lane_width, lap_length)
+    metrics["disturbance"] = {"name": scenario.name, "description": scenario.describe(), "patches": patches}
+    metrics["speed_tracking"] = speed_tracking(log, P, args.baseline, metrics)
     metrics["sim_time_s"] = k * TS
     metrics["wall_time_s"] = wall
     metrics["route_roads"] = [f"{r}{'+' if d > 0 else '-'}" for r, d in route]
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
     np.savez_compressed(out / "log.npz", **{k_: np.asarray(v) for k_, v in log.items()}, path_xy=path.xy)
     fig = plot(log, path, lap_length, P, out, metrics)
+    plot_disturbance(log, P, out, metrics, args.baseline)
     print("[m2] " + json.dumps({k_: v for k_, v in metrics.items() if k_ != "route_roads"}, indent=1))
     print(f"[m2] plot {fig}  ({k * TS:.0f} s simulated in {wall:.0f} s)")
     if args.record:
