@@ -164,7 +164,7 @@ vlm-assistant -c configs/sim_4b.yaml --stats
 | Symptom | Fix |
 |---|---|
 | `No matching distribution found for isaacsim-...` | Wrong Python version for that Isaac Sim release. Check `python --version` inside `~/isaac-env`. |
-| `ModuleNotFoundError: isaacsim.core.api` (or another `isaacsim.*` module) | The Python API was renamed in your Isaac Sim version. Send the full error to Claude; the fix is a one-line import change in `src/talk2drive/isaac/jetbot.py`. |
+| `ModuleNotFoundError: isaacsim.core.api` (or another `isaacsim.*` module) | The Python API was renamed in your Isaac Sim version. The fix is usually a one-line import change in `src/talk2drive/isaac/jetbot.py`. |
 | Black viewport / crash at start | Update the NVIDIA driver; close other GPU-heavy apps (games, the 8B assistant). |
 | Very low FPS | Use `--env grid` (the default) or `--headless`; warehouse scenes are heavier. |
 | `Could not find the Isaac Sim assets root` | Assets are streamed from the internet; check your connection or proxy. |
