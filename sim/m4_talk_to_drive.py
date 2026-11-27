@@ -32,6 +32,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -53,6 +54,8 @@ parser.add_argument("--record", action="store_true", help="save the viewport eve
 parser.add_argument("--no-dashcam", action="store_true", help="do not send the front camera to the dash cam recorder")
 parser.add_argument("--dashcam-fps", type=float, default=10.0, help="dash cam frames per simulated second")
 parser.add_argument("--box-at", type=float, default=None, help="test: put a box on the road this far along the route [m]")
+parser.add_argument("--test-new-shape", type=float, default=None, help="test: create a cone at the map centre at this time [s], like Create > Shape > Cone")
+parser.add_argument("--test-gui-stop", type=float, default=None, help="test: press Stop at this time [s], then Play")
 parser.add_argument("--out", default="runs/m4_talk")
 args = parser.parse_args()
 
@@ -67,6 +70,12 @@ from isaacsim import SimulationApp  # noqa: E402  (must start before the other I
 app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720})
 
 import numpy as np  # noqa: E402
+import omni.timeline  # noqa: E402
+from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
+
+if not args.headless:   # the Physics menus in the window (Add > Physics > Collider, Rigid Body, ...)
+    for extension in ("omni.physx.ui", "omni.kit.property.physics"):
+        enable_extension(extension)
 
 from talk2drive.commands import HELP, Command, SpeedCommander, interpret_with_llm, parse_command  # noqa: E402
 from talk2drive.dashcam_link import DashcamFeed  # noqa: E402
@@ -89,6 +98,8 @@ MODES = {"drive": 0, "pull_over": 1, "parked": 2, "rejoin": 3, "emergency": 4, "
 HOLD_BRAKE = 600.0      # brake force that holds the robot still [N] (the full emergency brake chatters at standstill)
 DASHCAM_SIZE = (640, 360)   # dash cam image size [pixels]
 HIT_FORCE = 500.0       # a contact pushing harder than this (not tyres on the road) is a collision [N]
+CONTACT_GAP = 3.0       # a collision is reported again only after this long without any contact [s]
+ROAD_SURFACES = ("/World/DriveSurface", "/World/GroundPlane")   # the body touching these is a bump or rollover
 STILL = 0.5             # below this speed the robot is held with HOLD_BRAKE instead of braking dynamically [m/s]
 NUDGE = 0.5             # one "steer left" moves this far to the side [m]
 NEAR_U_TURN = 60.0      # a U-turn spot this close is used before going round a roundabout or block [m]
@@ -193,6 +204,7 @@ class Robot:
         self.pending = None           # a move asked for during a U-turn, rejoin or emergency stop
         self.is_paved = None
         self.dashcam = None           # DashcamFeed, if the dash cam is on
+        self.placed = 0               # objects put on the road by command so far
         self.t = 0.0                  # simulation time [s]
 
     # -------- route
@@ -270,12 +282,17 @@ class Robot:
         if cmd.kind == "help":
             return ("I can go, stop, do an emergency stop, pull over, turn left or right or go straight at the "
                     "next junction, do a U-turn, change lanes, steer a little left or right in my lane, save the dash cam video, "
+                    "put a cone, box, barrel or ball on the road ahead (and remove them), "
                     "accelerate or brake a bit more each time you ask, hold or set a speed, and tell you "
                     "what's ahead or my status. Say it in your own words.")
         if cmd.kind == "reset":
             return self.reset()
         if cmd.kind == "save_clip":
             return self.save_clip()
+        if cmd.kind == "place":
+            return self.place_object(cmd.value["name"], cmd.value["dist"])
+        if cmd.kind == "clear_objects":
+            return self.clear_objects()
         if self.mode == "tipped":
             return "I've tipped over. Say 'reset' to put me back on the road."
         if cmd.kind in ("emergency", "stop"):
@@ -310,8 +327,11 @@ class Robot:
         if cmd.kind == "ahead":
             return self.whats_ahead()
         if cmd.kind == "status":
+            x, y = self.position
+            ahead = self.driver.path.xy[min(int((self.driver.s_hint + 20.0) / self.driver.path.ds), len(self.driver.path.xy) - 1)]
             return (f"Speed {v:.1f} m/s (set-point {self.speed.v_set:.1f}, rate {self.speed.rate:+.1f} m/s^2), "
-                    f"mode {self.mode}. " + self.whats_ahead())
+                    f"mode {self.mode}. Position x {x:.1f}, y {y:.1f}; 20 m ahead on my path: "
+                    f"x {ahead[0]:.1f}, y {ahead[1]:.1f}, ground z {self.bot.ground_height(*ahead):.2f}. " + self.whats_ahead())
         return f"Sorry, I didn't understand '{text}'. Try: {HELP}"
 
     def go(self):
@@ -521,6 +541,29 @@ class Robot:
             return "The dash cam recorder is not running (start: .venv/bin/python scripts/dashcam.py)."
         return "Saving the dash cam video: the last 60 seconds and the next 60 seconds."
 
+    def place_object(self, name, distance):
+        """Put an obstacle on the road where the robot is going, ``distance`` metres ahead of it."""
+        distance = float(np.clip(distance, 3.0, 200.0))
+        path = self.driver.path
+        s = self.driver.s_hint + distance
+        if s > path.length - 1.0:
+            return f"My path doesn't reach {distance:.0f} m ahead."
+        x, y = path.xy[int(s / path.ds)]
+        self.placed += 1
+        spawn_object(self.bot.world.stage, f"/World/Obstacles/placed{self.placed}", name, (x, y), self.bot.ground_height(x, y))
+        print(f"[talk] placed {name} at ({x:.1f}, {y:.1f})", flush=True)
+        article = "an" if name[0] in "aeiou" else "a"
+        return f"Put {article} {name} on the road {distance:.0f} m ahead of me (x {x:.1f}, y {y:.1f}). I can't see it, so I'll drive into it."
+
+    def clear_objects(self):
+        stage = self.bot.world.stage
+        paths = [f"/World/Obstacles/placed{i}" for i in range(1, self.placed + 1)]
+        paths = [p for p in paths if stage.GetPrimAtPath(p).IsValid()]
+        for p in paths:
+            stage.RemovePrim(p)
+            stage.RemovePrim(p + "_look")
+        return f"Removed {len(paths)} object{'s' if len(paths) != 1 else ''} I had put on the road." if paths else "There's nothing I put on the road."
+
     def reset(self):
         """Put the robot back on its wheels on the route where it is, stopped."""
         s = max(self.s, 0.0)
@@ -646,8 +689,8 @@ class Robot:
 # ---------------------------------------------------------------- dash cam and collisions
 def make_collision_detector(stage):
     """Returns check(dt) -> (what was hit, force [N]) for the hardest collision this step, or None.
-    A collision: the robot's body touching anything, or a tyre touching an obstacle (tyres on the
-    road or a kerb are normal driving)."""
+    A collision: the robot's body touching anything but the road surface, or a tyre touching an
+    obstacle (tyres on the road or a kerb are normal driving)."""
     from omni.physx import get_physx_simulation_interface
     from pxr import PhysicsSchemaTools, PhysxSchema, Usd, UsdPhysics
 
@@ -665,8 +708,10 @@ def make_collision_detector(stage):
             if a.startswith("/World/Jetbot") == b.startswith("/World/Jetbot"):
                 continue   # the robot touching itself, or two other things
             mine, other = (a, b) if a.startswith("/World/Jetbot") else (b, a)
-            if "wheel" in mine and not other.startswith("/World/Obstacles"):
-                continue   # tyres on the road (or on a kerb)
+            if "wheel" in mine and other.startswith(("/World/Environment",) + ROAD_SURFACES):
+                continue   # tyres on the road or a kerb: normal driving
+            if other.startswith(ROAD_SURFACES):
+                continue   # the body scraping the road: bottoming out or a rollover (reported on its own)
             points = data[h.contact_data_offset:h.contact_data_offset + h.num_contact_data]
             force = sum(float(np.linalg.norm(np.asarray(c.impulse))) for c in points) / dt
             if force > HIT_FORCE and (hardest is None or force > hardest[1]):
@@ -674,6 +719,39 @@ def make_collision_detector(stage):
         return hardest
 
     return check
+
+
+SCENE_PARTS = ("/World/Jetbot", "/World/Environment", "/World/Obstacles", "/World/DriveSurface", "/World/GroundPlane")
+
+
+def adopt_new_shapes(stage, robot, done: set) -> list:
+    """Shapes made by hand in the Isaac window (Create > Shape > ...): give each one a collider so
+    the robot can hit it, and if it was left at the map centre, put it on the road 20 m ahead of
+    the robot. (Isaac 6.2's own Add > Physics menu is broken.) Returns what to announce."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    world = stage.GetPrimAtPath("/World")
+    candidates = list(stage.GetPseudoRoot().GetChildren()) + (list(world.GetChildren()) if world else [])
+    messages = []
+    for prim in candidates:
+        path = str(prim.GetPath())
+        if path in done or path.startswith(SCENE_PARTS) or not prim.IsA(UsdGeom.Gprim):
+            continue
+        done.add(path)
+        what = prim.GetName()
+        xform = UsdGeom.XformCommonAPI(prim)
+        translate = xform.GetXformVectors(Usd.TimeCode.Default())[0]
+        if Gf.Vec3d(translate).GetLength() < 0.01:   # still at the map centre: put it in front of the robot
+            ahead = min(robot.driver.s_hint + 20.0, robot.driver.path.length - 1.0)
+            x, y = robot.driver.path.xy[int(ahead / robot.driver.path.ds)]
+            bottom = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"]).ComputeLocalBound(prim).ComputeAlignedRange().GetMin()[2]
+            xform.SetTranslate(Gf.Vec3d(float(x), float(y), robot.bot.ground_height(x, y) - bottom))
+            where = f" and put it on the road 20 m ahead of me (x {x:.1f}, y {y:.1f})"
+        else:
+            where = ""
+        UsdPhysics.CollisionAPI.Apply(prim)
+        messages.append(f"Made {what} solid{where}. I can't see it, so I'll drive into it.")
+    return messages
 
 
 def dashcam_image(camera):
@@ -735,7 +813,7 @@ def main():
     robot.position = start[:2]
     dashcam = None if args.no_dashcam else DashcamFeed(fps=args.dashcam_fps)
     robot.dashcam = dashcam
-    next_frame_t, last_hit_t = 0.0, -10.0
+    next_frame_t, last_hit_t = 0.0, -100.0
 
     try:
         from isaacsim.util.debug_draw import _debug_draw
@@ -759,8 +837,38 @@ def main():
         conversation.append(dict(t=t, said=None, reply=message))
         server.news.append(message)
 
+    paused, test_resume_at = False, None
+    own_shapes = set()   # shapes made by hand that already have a collider
     while step * TS < args.max_time and app.is_running() and not quit_now:
         t = step * TS
+
+        # 0. the Isaac window's Pause / Stop / Play buttons
+        if args.test_gui_stop is not None and t >= args.test_gui_stop and test_resume_at is None:
+            print("[talk] test: pressing Stop, then Play 2 s later", flush=True)
+            omni.timeline.get_timeline_interface().stop()
+            test_resume_at, args.test_gui_stop = time.time() + 2.0, None
+            continue
+        if test_resume_at and time.time() > test_resume_at:
+            omni.timeline.get_timeline_interface().play()
+            test_resume_at = 0.0
+        if not bot.world.is_playing():
+            if not paused:
+                paused = True
+                announce("Paused in the Isaac window. Press Play to carry on.")
+            for text, answer, done in server.take():
+                answer["reply"] = "I'm paused in the Isaac window. Press Play first."
+                done.set()
+            app.update()   # keep the window alive; the robot and its clock wait
+            continue
+        if paused or not bot.robot.handles_initialized:
+            paused = False
+            if bot.robot.handles_initialized:
+                announce("Running again.")
+            else:   # Stop then Play: Isaac has reset its physics, so put the robot back where it was
+                robot.reset()
+                announce("The simulation was stopped in the Isaac window. I'm back on the road where I was, "
+                         "stopped. Say 'go' to drive.")
+                continue
 
         # 1. commands: typed ones (HTTP) and scripted ones that are due
         incoming = server.take()
@@ -775,6 +883,16 @@ def main():
             conversation.append(dict(t=t, said=text, reply=reply))
             answer["reply"] = reply
             done.set()
+
+        if args.test_new_shape is not None and t >= args.test_new_shape:
+            from pxr import UsdGeom
+
+            UsdGeom.Cone.Define(bot.world.stage, "/Cone")
+            args.test_new_shape = None
+        # shapes added by hand in the Isaac window become solid (checked twice a second)
+        if step % max(1, int(0.5 / TS)) == 0:
+            for message in adopt_new_shapes(bot.world.stage, robot, own_shapes):
+                announce(message)
 
         # 2. where is the robot, what speed is allowed, any news
         position, _ = bot.robot.get_world_pose()
@@ -813,11 +931,18 @@ def main():
             image = dashcam_image(camera)
             if image is not None:
                 dashcam.frame(image, t)
-        driver.step(render=True)
+        try:
+            driver.step(render=True)
+        except (IndexError, TypeError, AttributeError):
+            if bot.world.is_playing() and bot.robot.handles_initialized:
+                raise   # a real error, not the Stop button
+            continue    # Stop was pressed during this step: handled at the top of the loop
         step += 1
-        hit = collided(TS)
-        if hit is not None and t - last_hit_t > 2.0:
+        hit = collided(TS) if robot.mode != "tipped" else None   # lying on its side is not a new collision
+        if hit is not None:
+            new_collision = t - last_hit_t > CONTACT_GAP   # still touching the same thing: already reported
             last_hit_t = t
+        if hit is not None and new_collision:
             print(f"[talk] collision with {hit[0]} ({hit[1]:.0f} N)", flush=True)
             robot.do(Command("emergency"), J.is_paved)
             saved = robot.save_clip("collision", f"hit {hit[0]} with {hit[1]:.0f} N")

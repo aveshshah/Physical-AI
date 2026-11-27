@@ -324,9 +324,17 @@ the global route on the OpenDRIVE road graph and the CARLA NMPC tracks it.
 | change lane left / right | into the next lane going the same way (never into oncoming traffic) |
 | steer left / right | 0.5 m to the side inside the lane, back to the centre before the next junction |
 | pull over | parks at the right-hand edge, away from junctions |
-| what's ahead / status / help / reset | junctions coming up, speed and mode, the list of commands, back on the wheels after tipping |
+| what's ahead / status / help / reset | junctions coming up; speed, mode and position; the list of commands; back on the wheels after tipping |
+| put a cone 30 m ahead / remove the objects | puts a cone, box, barrel or ball on the road ahead (the robot can't see it and will hit it); removes them |
+| save the video | keeps the dash cam footage from 60 s before to 60 s after |
 
-A move asked for while stopped also starts the robot. Phrases the keyword parser doesn't know
+A move asked for while stopped also starts the robot. A collision is announced once, followed by
+emergency braking.
+
+In the Isaac window, shapes made with Create → Shape become solid on their own. If a shape is left
+at the map centre, it is moved onto the road 20 m ahead of the robot. This replaces Isaac 6.2's
+Add → Physics menu, which is broken. Pause, Stop and Play in the window are safe: after a Stop, the
+robot is put back where it was, stopped. Phrases the keyword parser doesn't know
 ("let me out here", "give the cyclist more room") go to the local Qwen3-VL-4B model, which picks
 one of the commands above or explains why it can't.
 

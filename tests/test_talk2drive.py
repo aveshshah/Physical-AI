@@ -195,6 +195,9 @@ def test_parse_command():
         "change lane left": ("lane", "left"), "switch to the right lane": ("lane", "right"), "overtake": ("lane", None),
         "steer left": ("nudge", "left"), "move a bit to the right": ("nudge", "right"), "keep left": ("nudge", "left"),
         "back to the middle": ("centre", None), "take left": ("turn", "left"),
+        "save the video": ("save_clip", None), "remove the cones": ("clear_objects", None),
+        "put a cone 15 m ahead": ("place", {"name": "orange traffic cone", "dist": 15.0}),
+        "drop a box": ("place", {"name": "brown cardboard box", "dist": 30.0}),
     }
     for text, (kind, value) in cases.items():
         c = parse_command(text)

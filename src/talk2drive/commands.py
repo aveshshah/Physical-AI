@@ -12,12 +12,13 @@ from dataclasses import dataclass
 
 HELP = ("go | stop | emergency stop | pull over | turn left | turn right | go straight | u-turn | "
         "change lane left/right | steer left/right (a bit) | back to the centre | save the video | "
+        "put a cone 30 m ahead | remove the objects | "
         "accelerate (more) | brake (more) | hold speed | set speed 8 | what's ahead | status | reset")
 
 
 @dataclass
 class Command:
-    kind: str            # go, stop, emergency, pull_over, turn, u_turn, lane, nudge, centre, accelerate,
+    kind: str            # go, stop, emergency, pull_over, turn, u_turn, lane, nudge, centre, place, clear_objects, accelerate,
                          # brake, hold, set_speed, ahead, status, reset, help, unknown
     value: object = None  # turn: "left"/"right"/"straight"; lane, nudge: "left"/"right"/None; set_speed: m/s
 
@@ -30,8 +31,18 @@ def _side(t: str):
     return None
 
 
+OBJECTS = {"cone": "orange traffic cone", "box": "brown cardboard box", "barrel": "blue barrel",
+           "ball": "yellow ball", "obstacle": "orange traffic cone", "object": "orange traffic cone"}
+
+
 def parse_command(text: str) -> Command:
     t = text.lower().strip()
+    thing = re.search(r"\b(cone|box|barrel|ball|obstacle|object)s?\b", t)
+    if thing and re.search(r"\b(remove|clear|delete|take away|get rid)\b", t):
+        return Command("clear_objects")
+    if thing and re.search(r"\b(put|place|drop|add|spawn|set|throw)\b", t):
+        distance = re.search(r"(\d+(?:\.\d+)?)\s*(m\b|meters?|metres?)", t)
+        return Command("place", {"name": OBJECTS[thing.group(1)], "dist": float(distance.group(1)) if distance else 30.0})
     if re.search(r"\breset\b|put (me|it|yourself) back|recover|get up", t):
         return Command("reset")
     if re.search(r"what can you do|\bhelp\b|what commands|what do you understand", t):
