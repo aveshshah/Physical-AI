@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 
 HELP = ("go | stop | emergency stop | pull over | turn left | turn right | go straight | u-turn | "
-        "change lane left/right | steer left/right (a bit) | back to the centre | "
+        "change lane left/right | steer left/right (a bit) | back to the centre | save the video | "
         "accelerate (more) | brake (more) | hold speed | set speed 8 | what's ahead | status | reset")
 
 
@@ -38,6 +38,9 @@ def parse_command(text: str) -> Command:
         return Command("help")
     if re.search(r"u[- ]?turn|\byou turn|turn (a)?round|turn back|go back|other way|opposite direction|head back", t):
         return Command("u_turn")
+    if re.search(r"\b(save|store|mark|record)\b.*\b(video|clip|footage|recording|this|that)\b|"
+                 r"\bkeep\b.*\b(video|clip|footage|recording)\b|dash ?cam", t):
+        return Command("save_clip")
     if re.search(r"emergenc|e-?stop|stop now|full brake|brake hard|slam", t):
         return Command("emergency")
     if re.search(r"pull over|park|side of the road|to the side|kerb|curb", t) and not re.search(r"away from|off the", t):
@@ -168,6 +171,7 @@ Commands it can do:
   lane_left / lane_right       change into the next lane on that side (same direction of travel)
   steer_left / steer_right     move a little (0.5 m) to that side inside its own lane
   centre        go back to the middle of its lane
+  save_clip     keep the dash cam video of the last 60 s and the next 60 s (e.g. after something happened)
   accelerate    speed up (each command a bit harder)
   brake         slow down (each command a bit harder)
   hold          keep the current speed
@@ -185,7 +189,8 @@ LLM_COMMANDS = {
     "go": Command("go"), "stop": Command("stop"), "emergency": Command("emergency"), "pull_over": Command("pull_over"),
     "turn_left": Command("turn", "left"), "turn_right": Command("turn", "right"), "go_straight": Command("turn", "straight"),
     "u_turn": Command("u_turn"), "lane_left": Command("lane", "left"), "lane_right": Command("lane", "right"),
-    "steer_left": Command("nudge", "left"), "steer_right": Command("nudge", "right"), "centre": Command("centre"), "accelerate": Command("accelerate"), "brake": Command("brake"), "hold": Command("hold"),
+    "steer_left": Command("nudge", "left"), "steer_right": Command("nudge", "right"), "centre": Command("centre"),
+    "save_clip": Command("save_clip"), "accelerate": Command("accelerate"), "brake": Command("brake"), "hold": Command("hold"),
     "ahead": Command("ahead"), "status": Command("status"), "reset": Command("reset"),
 }
 

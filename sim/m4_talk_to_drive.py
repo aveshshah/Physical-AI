@@ -17,6 +17,10 @@ where the robot is (also from a stop or from a parking spot), or, where the road
 way, goes round the nearest roundabout or block and comes back. "Change lane left" moves into the next
 lane going the same way; "steer left" moves 0.5 m to the side inside the lane (until the next
 junction). A move asked for while stopped also starts the robot. The CARLA NMPC drives.
+
+Dash cam: the front camera (640 x 360, 10 frames per simulated second) is sent to the recorder,
+scripts/dashcam.py, which runs as its own process (start it first or later; without it the frames
+are simply dropped). A collision or rollover, or "save the video", keeps 60 s before and after.
 """
 
 from __future__ import annotations
@@ -46,6 +50,9 @@ parser.add_argument("--max-time", type=float, default=1800.0, help="end the run 
 parser.add_argument("--nmpc-dir", default=os.path.expanduser("~/Documents/carla_nmpc_project"))
 parser.add_argument("--headless", action="store_true")
 parser.add_argument("--record", action="store_true", help="save the viewport every 0.5 s and a GIF")
+parser.add_argument("--no-dashcam", action="store_true", help="do not send the front camera to the dash cam recorder")
+parser.add_argument("--dashcam-fps", type=float, default=10.0, help="dash cam frames per simulated second")
+parser.add_argument("--box-at", type=float, default=None, help="test: put a box on the road this far along the route [m]")
 parser.add_argument("--out", default="runs/m4_talk")
 args = parser.parse_args()
 
@@ -61,11 +68,12 @@ app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720})
 
 import numpy as np  # noqa: E402
 
-from talk2drive.commands import HELP, SpeedCommander, interpret_with_llm, parse_command  # noqa: E402
+from talk2drive.commands import HELP, Command, SpeedCommander, interpret_with_llm, parse_command  # noqa: E402
+from talk2drive.dashcam_link import DashcamFeed  # noqa: E402
 from talk2drive.disturbances import BodyForceApplier, RoadLoadModel, parse_scenario  # noqa: E402
 from talk2drive.isaac import jetbot as J  # noqa: E402
 from talk2drive.isaac.jetbot import IsaacJetbot  # noqa: E402
-from talk2drive.isaac.props import HALF_WIDTH  # noqa: E402
+from talk2drive.isaac.props import HALF_WIDTH, make_front_camera, spawn_object  # noqa: E402
 from talk2drive.isaac.simtools import ViewportRecorder, chase_view, road_height  # noqa: E402
 from talk2drive.maneuvers import PARK_BRAKE, find_pull_over_spot, offset_path, shift_length, sideways_path, u_turn_path  # noqa: E402
 from talk2drive.mcity import MCITY_XODR, mcity_to_sim  # noqa: E402
@@ -79,6 +87,8 @@ MIN_TURN_DIST = 1.0     # a commanded turn is taken if its junction starts at le
 NORMAL_DECEL = 3.5      # beyond this braking need, a sharp bend ahead is approached with the emergency brake [m/s^2]
 MODES = {"drive": 0, "pull_over": 1, "parked": 2, "rejoin": 3, "emergency": 4, "tipped": 5, "u_turn": 6}
 HOLD_BRAKE = 600.0      # brake force that holds the robot still [N] (the full emergency brake chatters at standstill)
+DASHCAM_SIZE = (640, 360)   # dash cam image size [pixels]
+HIT_FORCE = 500.0       # a contact pushing harder than this (not tyres on the road) is a collision [N]
 STILL = 0.5             # below this speed the robot is held with HOLD_BRAKE instead of braking dynamically [m/s]
 NUDGE = 0.5             # one "steer left" moves this far to the side [m]
 NEAR_U_TURN = 60.0      # a U-turn spot this close is used before going round a roundabout or block [m]
@@ -182,6 +192,8 @@ class Robot:
         self.turnback_index = None    # going round a block to turn back: index of the road going back
         self.pending = None           # a move asked for during a U-turn, rejoin or emergency stop
         self.is_paved = None
+        self.dashcam = None           # DashcamFeed, if the dash cam is on
+        self.t = 0.0                  # simulation time [s]
 
     # -------- route
     def use_route(self, roads, keep_lane=False):
@@ -257,11 +269,13 @@ class Robot:
         v = self.v
         if cmd.kind == "help":
             return ("I can go, stop, do an emergency stop, pull over, turn left or right or go straight at the "
-                    "next junction, do a U-turn, change lanes, steer a little left or right in my lane, "
+                    "next junction, do a U-turn, change lanes, steer a little left or right in my lane, save the dash cam video, "
                     "accelerate or brake a bit more each time you ask, hold or set a speed, and tell you "
                     "what's ahead or my status. Say it in your own words.")
         if cmd.kind == "reset":
             return self.reset()
+        if cmd.kind == "save_clip":
+            return self.save_clip()
         if self.mode == "tipped":
             return "I've tipped over. Say 'reset' to put me back on the road."
         if cmd.kind in ("emergency", "stop"):
@@ -499,6 +513,14 @@ class Robot:
         self.mode, self.nudge, self.lane_force = "u_turn", 0.0, None
         return True, ("OK: turning around now." if distance < 5.0 else f"OK: turning around in {distance:.0f} m.")
 
+    def save_clip(self, kind="manual", note=""):
+        """Ask the dash cam recorder to keep the video from 60 s before to 60 s after now."""
+        if self.dashcam is None:
+            return "The dash cam is off."
+        if not self.dashcam.event(kind, self.t, note):
+            return "The dash cam recorder is not running (start: .venv/bin/python scripts/dashcam.py)."
+        return "Saving the dash cam video: the last 60 seconds and the next 60 seconds."
+
     def reset(self):
         """Put the robot back on its wheels on the route where it is, stopped."""
         s = max(self.s, 0.0)
@@ -538,7 +560,7 @@ class Robot:
     # -------- every control step
     def update(self, position, t, dt):
         """Track where the robot is, finish manoeuvres, and give the speed cap for this step."""
-        self.position = position
+        self.position, self.t = position, t
         self.s, self.lat = self.route.path.project(*position, self.s, window=30.0)
         # speed from how far the robot got along the route in the last 0.5 s (the body's own
         # velocity reading jitters when the robot stands with its brakes on)
@@ -621,6 +643,47 @@ class Robot:
         return self.speed.v_set, messages
 
 
+# ---------------------------------------------------------------- dash cam and collisions
+def make_collision_detector(stage):
+    """Returns check(dt) -> (what was hit, force [N]) for the hardest collision this step, or None.
+    A collision: the robot's body touching anything, or a tyre touching an obstacle (tyres on the
+    road or a kerb are normal driving)."""
+    from omni.physx import get_physx_simulation_interface
+    from pxr import PhysicsSchemaTools, PhysxSchema, Usd, UsdPhysics
+
+    for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/Jetbot")):
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr(0.0)
+    physx = get_physx_simulation_interface()
+
+    def check(dt):
+        headers, data = physx.get_contact_report()
+        hardest = None
+        for h in headers:
+            a = str(PhysicsSchemaTools.intToSdfPath(h.collider0))
+            b = str(PhysicsSchemaTools.intToSdfPath(h.collider1))
+            if a.startswith("/World/Jetbot") == b.startswith("/World/Jetbot"):
+                continue   # the robot touching itself, or two other things
+            mine, other = (a, b) if a.startswith("/World/Jetbot") else (b, a)
+            if "wheel" in mine and not other.startswith("/World/Obstacles"):
+                continue   # tyres on the road (or on a kerb)
+            points = data[h.contact_data_offset:h.contact_data_offset + h.num_contact_data]
+            force = sum(float(np.linalg.norm(np.asarray(c.impulse))) for c in points) / dt
+            if force > HIT_FORCE and (hardest is None or force > hardest[1]):
+                hardest = (f"{other.replace('/World/', '')} (robot part {mine.replace('/World/Jetbot/', '')})", force)
+        return hardest
+
+    return check
+
+
+def dashcam_image(camera):
+    """The camera's latest RGB image (height x width x 3, uint8), or None before the first frame."""
+    rgba = camera.get_rgba()
+    if rgba is None or np.ndim(rgba) != 3 or np.size(rgba) == 0:
+        return None
+    return np.ascontiguousarray(np.asarray(rgba)[:, :, :3], dtype=np.uint8)
+
+
 # ---------------------------------------------------------------- drawing
 def draw_route(line_drawer, robot):
     """Green: the route ahead; magenta: a manoeuvre; yellow dots: junctions where the route turns."""
@@ -659,12 +722,20 @@ def main():
     J.build_paved_mask(bot.world.stage, "mcity")
     bot.enable_torque_mode()
     bot.params.max_steer = float(np.deg2rad(nmpc.P.MAX_STEER_DEG))
+    if args.box_at is not None:
+        x, y = route.path.xy[int(args.box_at / route.path.ds)]
+        spawn_object(bot.world.stage, "/World/Obstacles/box", "brown cardboard box", (x, y), bot.ground_height(x, y))
+    camera = None if args.no_dashcam else make_front_camera(bot, with_depth=False, resolution=DASHCAM_SIZE)
+    collided = make_collision_detector(bot.world.stage)
     bot.reset_to(start, settle_steps=60)
     loads = RoadLoadModel(parse_scenario("nominal"), nmpc.P, route.path.length, dt=TS)
     driver = TadpoleDriver(nmpc, bot, loads, BodyForceApplier("/World/Jetbot/chassis"))
     driver.set_path(route.path, 0.0)
     robot = Robot(router, route, driver, SpeedCommander(float(nmpc.P.V_MAX)), bot, float(nmpc.P.AY_CURVE))
     robot.position = start[:2]
+    dashcam = None if args.no_dashcam else DashcamFeed(fps=args.dashcam_fps)
+    robot.dashcam = dashcam
+    next_frame_t, last_hit_t = 0.0, -10.0
 
     try:
         from isaacsim.util.debug_draw import _debug_draw
@@ -682,6 +753,12 @@ def main():
     log = {k: [] for k in ("t", "x", "y", "psi", "vx", "v_ref", "v_set", "mode", "s_route", "lat", "fx_brake",
                            "s_path", "path_length", "cte", "delta_cmd", "status", "plan_mode", "v_cap")}
     step, quit_now = 0, False
+
+    def announce(message):
+        print(f"[bot] {message}", flush=True)
+        conversation.append(dict(t=t, said=None, reply=message))
+        server.news.append(message)
+
     while step * TS < args.max_time and app.is_running() and not quit_now:
         t = step * TS
 
@@ -703,9 +780,7 @@ def main():
         position, _ = bot.robot.get_world_pose()
         v_cap, messages = robot.update((float(position[0]), float(position[1])), t, TS)
         for message in messages:
-            print(f"[bot] {message}", flush=True)
-            conversation.append(dict(t=t, said=None, reply=message))
-            server.news.append(message)
+            announce(message)
 
         # 3. the NMPC drives one step
         # emergency: the full emergency brake while moving; once (nearly) stopped, or whenever the
@@ -733,16 +808,29 @@ def main():
             chase_view(row["x"], row["y"], row["psi"], bot.ground_height(row["x"], row["y"]), 8.0, 4.0, 8, 0.5)
         if recorder is not None:
             recorder.capture(t)
+        if dashcam is not None and t >= next_frame_t:
+            next_frame_t += 1.0 / args.dashcam_fps
+            image = dashcam_image(camera)
+            if image is not None:
+                dashcam.frame(image, t)
         driver.step(render=True)
         step += 1
+        hit = collided(TS)
+        if hit is not None and t - last_hit_t > 2.0:
+            last_hit_t = t
+            print(f"[talk] collision with {hit[0]} ({hit[1]:.0f} N)", flush=True)
+            robot.do(Command("emergency"), J.is_paved)
+            saved = robot.save_clip("collision", f"hit {hit[0]} with {hit[1]:.0f} N")
+            announce("Collision! Emergency braking. " + saved)
         if robot.mode != "tipped" and (abs(row["roll"]) > math.radians(45) or abs(row["pitch"]) > math.radians(45)):
             robot.mode = "tipped"
             robot.speed.hold(0.0)
-            message = "I've tipped over. Say 'reset' to put me back on the road."
-            print(f"[bot] {message}", flush=True)
-            conversation.append(dict(t=t, said=None, reply=message))
-            server.news.append(message)
+            saved = robot.save_clip("rollover", f"roll {math.degrees(row['roll']):.0f} deg, pitch {math.degrees(row['pitch']):.0f} deg")
+            announce("I've tipped over. Say 'reset' to put me back on the road. " + saved)
 
+    if dashcam is not None:
+        dashcam.close()
+        print(f"[talk] dash cam: {dashcam.sent} frames sent, {dashcam.dropped} dropped", flush=True)
     (out / "conversation.json").write_text(json.dumps(conversation, indent=1))
     np.savez_compressed(out / "log.npz", **{k: np.asarray(v) for k, v in log.items()})
     print(f"[talk] saved {out}", flush=True)

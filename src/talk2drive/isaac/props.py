@@ -67,14 +67,14 @@ def spawn_object(stage, path: str, name: str, xy, ground_z: float, collide: bool
         UsdPhysics.CollisionAPI.Apply(g.GetPrim())
 
 
-def make_front_camera(bot, with_depth: bool = True):
+def make_front_camera(bot, with_depth: bool = True, resolution=CAM_RES):
     """RGB(-D) camera behind the windscreen (moves with the body), 60 deg horizontal field of view."""
     from isaacsim.core.utils.rotations import euler_angles_to_quat
     from isaacsim.sensors.camera import Camera
     from pxr import UsdGeom
 
     path = "/World/Jetbot/chassis/front_cam"
-    cam = Camera(prim_path=path, resolution=CAM_RES)
+    cam = Camera(prim_path=path, resolution=resolution)
     cam.initialize()
     cam.set_local_pose(translation=np.array(CAM_POS),
                        orientation=euler_angles_to_quat(np.array([0.0, CAM_PITCH_DEG, 0.0]), degrees=True), camera_axes="world")

@@ -340,6 +340,47 @@ OMNI_KIT_ACCEPT_EULA=YES DISPLAY=:1 ~/isaac-env/bin/python sim/m4_talk_to_drive.
 Voice runs offline: Whisper small.en for speech recognition and Piper for the replies (`pip install -e .[voice]`).
 Speak over the robot to interrupt it.
 
+### Dash cam (loop recording)
+
+`scripts/dashcam.py` records the robot's front camera like a dash cam, as its own process (if the
+assistant or the language model fails, recording goes on). It follows section 5 of the AI Road
+Companion report:
+
+* **Loop recording:** 640 × 360 at 10 frames per simulated second, in 30-second MP4 videos in
+  `runs/dashcam/rolling/`. The last 10 minutes are kept and older videos are deleted
+  (`--keep` and `--segment` change this).
+* **Incidents:** a collision (the robot's body touching anything, or a tyre touching an obstacle),
+  a rollover, "save the video" or `dashcam.py trigger` keeps the footage from 60 s before to 60 s
+  after (`--pre` and `--post` change this), in whole 30 s videos. Another event during that time
+  extends it to 60 s after the last one. Incidents are never deleted automatically.
+* **Sealing:** the clip goes to `runs/dashcam/incidents/<id>/`, with `incident.mp4` joined from the
+  segments, every frame's simulation, wall-clock and monotonic time, and `manifest.json` with the
+  SHA-256 of every file. The files are then made read-only.
+* **Verification:** the clip is marked `incomplete`, with the reason, when the footage doesn't
+  reach 60 s back, the simulation stops early, or frames are missing. After a crash, the recorder
+  seals unfinished incidents as incomplete when it starts again.
+* **Deletion:** loop cleanup only touches `rolling/`. `dashcam.py delete ID` refuses unless a
+  person types the incident ID at a terminal.
+
+```bash
+.venv/bin/python scripts/dashcam.py                 # 1. the recorder (start before or after the simulation)
+OMNI_KIT_ACCEPT_EULA=YES DISPLAY=:1 ~/isaac-env/bin/python sim/m4_talk_to_drive.py   # 2. sends the camera
+.venv/bin/python scripts/dashcam.py list            # incidents, complete or not, and why
+.venv/bin/python scripts/dashcam.py verify ID       # re-check the hashes
+```
+
+The simulation never waits for the recorder. If the recorder is slow or not running, frames are
+dropped and the gap in frame numbers shows in the manifest. `--box-at 520` puts a box on the road
+for a crash test.
+
+Tested by driving into a box at 74.7 s: incident complete, footage 14.0–134.9 s, 1210 frames,
+1500 sent and 0 dropped. The `tests/test_dashcam.py` tests cover coverage, early trigger, repeated
+collisions, early exit, dropped frames, tampering, deletion and crash recovery.
+
+Protection is limited: read-only files stop ordinary writes by the same user, not root. For real
+evidence, run the recorder as a separate `roadrec` account that owns the store, as the report
+describes.
+
 ## Layout
 
 ```

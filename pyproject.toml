@@ -26,8 +26,9 @@ gpu = [
     "qwen-vl-utils>=0.0.14",
 ]
 quant = ["bitsandbytes>=0.45"]
-# LoRA / QLoRA fine-tuning of the VLM (scripts/finetune_planner.py)
+# Offline speech for scripts/voice.py
 voice = ["faster-whisper>=1.0", "piper-tts>=1.2"]
+# LoRA / QLoRA fine-tuning of the VLM (scripts/finetune_planner.py)
 finetune = ["peft>=0.13", "bitsandbytes>=0.45"]
 web = ["gradio>=5"]
 # Talk-to-Drive controllers (NMPC) and plots; Isaac Sim itself is installed separately.
